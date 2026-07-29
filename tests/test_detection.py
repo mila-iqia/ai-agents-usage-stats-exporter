@@ -12,10 +12,10 @@ import pytest
 from ai_agents_usage_stats_exporter import (
     AIAgentCollector,
     AgentType,
+    DetectionResult,
     DetectionRule,
     ProcInfo,
     detect_agent,
-    matched_heuristics,
     sanitized_cmdline,
 )
 
@@ -45,7 +45,7 @@ def test_direct_agent_signatures(proc_info: ProcInfo, expected: tuple[AgentType,
     """Test detection of direct AI agent binary names, packages, and module execution patterns."""
     agent_type, is_remote = expected
     expected_rule = DetectionRule.CMDLINE_AGENT_SIGNATURE
-    assert detect_agent(proc_info) == (agent_type, expected_rule)
+    assert detect_agent(proc_info) == DetectionResult(agent_type, expected_rule, (expected_rule,))
     assert is_remote is False
 
 
@@ -56,14 +56,18 @@ def test_environment_variable_detection() -> None:
         "cmdline": ["python", "script.py"],
         "environ": {"CLAUDE_CODE_ENTRYPOINT": "cli"},
     }
-    assert detect_agent(proc_info) == (AgentType.CLAUDE, DetectionRule.ENV_CLAUDE)
+    assert detect_agent(proc_info) == DetectionResult(
+        AgentType.CLAUDE, DetectionRule.ENV_CLAUDE, (DetectionRule.ENV_CLAUDE,)
+    )
 
     proc_info_aider: ProcInfo = {
         "name": "python",
         "cmdline": ["python", "app.py"],
         "environ": {"AIDER_MODEL": "claude-3-5-sonnet"},
     }
-    assert detect_agent(proc_info_aider) == (AgentType.AIDER, DetectionRule.ENV_AIDER)
+    assert detect_agent(proc_info_aider) == DetectionResult(
+        AgentType.AIDER, DetectionRule.ENV_AIDER, (DetectionRule.ENV_AIDER,)
+    )
 
 
 def test_noninteractive_ssh_heuristic() -> None:
@@ -75,9 +79,10 @@ def test_noninteractive_ssh_heuristic() -> None:
             "SSH_CONNECTION": "192.0.2.1 22 192.0.2.2 12345",
         },
     }
-    assert detect_agent(proc_info) == (
+    assert detect_agent(proc_info) == DetectionResult(
         AgentType.REMOTE_AGENT,
         DetectionRule.SSH_NONINTERACTIVE_COMMAND,
+        (DetectionRule.SSH_NONINTERACTIVE_COMMAND,),
     )
 
 
@@ -88,8 +93,11 @@ def test_remote_subshell_heuristics() -> None:
         "cmdline": ["bash", "-c", "git status 2>/dev/null"],
         "environ": {"CLAUDE_CODE": "1"},
     }
-    assert detect_agent(proc_info) == (AgentType.REMOTE_AGENT, DetectionRule.SSH_STDERR_REDIRECTION)
-    assert DetectionRule.SSH_STDERR_REDIRECTION in matched_heuristics(proc_info)
+    assert detect_agent(proc_info) == DetectionResult(
+        AgentType.REMOTE_AGENT,
+        DetectionRule.SSH_STDERR_REDIRECTION,
+        (DetectionRule.SSH_STDERR_REDIRECTION,),
+    )
 
 
 def test_sanitized_cmdline_redacts_inline_secrets() -> None:
@@ -107,7 +115,7 @@ def test_non_agent_process() -> None:
         "cmdline": ["vim", "file.txt"],
         "environ": {},
     }
-    assert detect_agent(proc_info) == (None, None)
+    assert detect_agent(proc_info) is None
 
 
 def test_collector_metrics_output() -> None:

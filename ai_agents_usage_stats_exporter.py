@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
-from typing import Any, Generator, Pattern, TypedDict
+from typing import Any, Generator, NamedTuple, Pattern, TypedDict
 from wsgiref.simple_server import WSGIRequestHandler, make_server
 
 import psutil
@@ -70,6 +70,14 @@ class DetectionRule(str, Enum):
     ENV_CURSOR = "env:cursor"
     SSH_STDERR_REDIRECTION = "ssh:stderr_redirection"
     SSH_NONINTERACTIVE_COMMAND = "ssh:noninteractive_command"
+
+
+class DetectionResult(NamedTuple):
+    """A classified process and every heuristic category that matched it."""
+
+    agent_type: AgentType
+    detection_rule: DetectionRule
+    matched_heuristics: tuple[DetectionRule, ...]
 
 
 @lru_cache(maxsize=200)
@@ -139,50 +147,27 @@ SENSITIVE_ARGUMENT_RE: Pattern[str] = re.compile(
 )
 
 
-def matched_heuristics(proc_info: ProcInfo) -> list[DetectionRule]:
-    """Return every bounded heuristic code matching a process, in priority order."""
-    cmdline = proc_info.get("cmdline") or []
-    cmdline_str = " ".join(cmdline)
-    full_search_str = f"{proc_info.get('name') or ''} {proc_info.get('exe') or ''} {cmdline_str}"
-    envs = proc_info.get("environ") or {}
-    rules: list[DetectionRule] = []
-
-    for agent_type, pattern in KNOWN_AGENT_SIGNATURES:
-        if pattern.search(full_search_str):
-            rules.append(
-                DetectionRule.SSH_AGENT_SIGNATURE
-                if "SSH_CONNECTION" in envs
-                else DetectionRule.CMDLINE_AGENT_SIGNATURE
-            )
-    if any(k in envs for k in ("CLAUDE_CODE_ENTRYPOINT", "CLAUDE_SESSION_ID")):
-        rules.append(DetectionRule.ENV_CLAUDE)
-    if any(k.startswith("AIDER_") for k in envs):
-        rules.append(DetectionRule.ENV_AIDER)
-    if "CURSOR_TRACE" in envs:
-        rules.append(DetectionRule.ENV_CURSOR)
-    if REMOTE_SUBSHELL_REDIRECTION_RE.search(cmdline_str) and any(
-        pattern.search(cmdline_str) or pattern.search(str(envs))
-        for pattern in REMOTE_AGENT_CMD_PATTERNS
-    ):
-        rules.append(DetectionRule.SSH_STDERR_REDIRECTION)
-    if "SSH_CONNECTION" in envs and "SSH_TTY" not in envs:
-        rules.append(DetectionRule.SSH_NONINTERACTIVE_COMMAND)
-    return rules
-
-
-def detect_agent(proc_info: ProcInfo) -> tuple[AgentType | None, DetectionRule | None]:
+def detect_agent(proc_info: ProcInfo) -> DetectionResult | None:
     """
     Analyzes process metadata (name, executable path, command line, environment)
     to detect whether a process belongs to a known AI agent tool.
 
     Returns:
-        tuple[agent_type, detection_rule]: Identified agent and the transparent rule
-        that triggered detection, or ``(None, None)`` if no rule matches.
+        A typed detection result, or ``None`` when no heuristic matches.
     """
     cmdline: list[str] = proc_info.get("cmdline") or []
     cmdline_str: str = " ".join(cmdline)
     envs: dict[str, str] = proc_info.get("environ") or {}
-    rules = matched_heuristics(proc_info)
+    matched_rules: list[DetectionRule] = []
+    selected: tuple[AgentType, DetectionRule] | None = None
+
+    def add_match(agent_type: AgentType, rule: DetectionRule) -> None:
+        """Record a rule once and retain the first match as the classification."""
+        nonlocal selected
+        if rule not in matched_rules:
+            matched_rules.append(rule)
+        if selected is None:
+            selected = (agent_type, rule)
 
     # Step 1: Match against known direct binary and module signatures
     for agent_type, pattern in KNOWN_AGENT_SIGNATURES:
@@ -195,27 +180,32 @@ def detect_agent(proc_info: ProcInfo) -> tuple[AgentType | None, DetectionRule |
                 if "SSH_CONNECTION" in envs
                 else DetectionRule.CMDLINE_AGENT_SIGNATURE
             )
-            return agent_type, rule
+            add_match(agent_type, rule)
 
     # Step 2: Inspect process environment variables if accessible
     if any(k in envs for k in ("CLAUDE_CODE_ENTRYPOINT", "CLAUDE_SESSION_ID")):
-        return AgentType.CLAUDE, DetectionRule.ENV_CLAUDE
+        add_match(AgentType.CLAUDE, DetectionRule.ENV_CLAUDE)
     if any(k.startswith("AIDER_") for k in envs):
-        return AgentType.AIDER, DetectionRule.ENV_AIDER
+        add_match(AgentType.AIDER, DetectionRule.ENV_AIDER)
     if "CURSOR_TRACE" in envs:
-        return AgentType.CURSOR, DetectionRule.ENV_CURSOR
+        add_match(AgentType.CURSOR, DetectionRule.ENV_CURSOR)
 
     # Step 3: Check heuristic subshell redirection patterns for SSH-invoked remote agents
-    if DetectionRule.SSH_STDERR_REDIRECTION in rules:
-        return AgentType.REMOTE_AGENT, DetectionRule.SSH_STDERR_REDIRECTION
+    if REMOTE_SUBSHELL_REDIRECTION_RE.search(cmdline_str) and any(
+        pattern.search(cmdline_str) or pattern.search(str(envs))
+        for pattern in REMOTE_AGENT_CMD_PATTERNS
+    ):
+        add_match(AgentType.REMOTE_AGENT, DetectionRule.SSH_STDERR_REDIRECTION)
 
     # SSH does not identify the local program that issued a command.  Treat an
     # agent-less, non-interactive SSH command as a low-confidence remote-agent
     # heuristic, but make that fact visible to metric consumers in its rule code.
     if "SSH_CONNECTION" in envs and "SSH_TTY" not in envs:
-        return AgentType.REMOTE_AGENT, DetectionRule.SSH_NONINTERACTIVE_COMMAND
+        add_match(AgentType.REMOTE_AGENT, DetectionRule.SSH_NONINTERACTIVE_COMMAND)
 
-    return None, None
+    if selected is None:
+        return None
+    return DetectionResult(*selected, tuple(matched_rules))
 
 
 def sanitized_cmdline(cmdline: list[str]) -> list[str]:
@@ -239,18 +229,17 @@ def observe_processes(duration: float, interval: float, output_path: str) -> int
                         proc_info["environ"] = proc.environ()
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         proc_info["environ"] = {}
-                    rules = matched_heuristics(proc_info)
-                    if not rules:
+                    detection = detect_agent(proc_info)
+                    if detection is None:
                         continue
                     pid = proc_info.get("pid", proc.pid)
                     cmdline = proc_info.get("cmdline") or []
-                    identity = (pid, tuple(cmdline), tuple(rules))
+                    identity = (pid, tuple(cmdline), detection.matched_heuristics)
                     if identity in seen:
                         continue
                     seen.add(identity)
                     uids = proc_info.get("uids")
                     uid = uids.real if uids else proc.uids().real
-                    agent_type, detection_rule = detect_agent(proc_info)
                     signal_env_keys = sorted(
                         key
                         for key in proc_info["environ"]
@@ -274,15 +263,13 @@ def observe_processes(duration: float, interval: float, output_path: str) -> int
                                 "name": proc_info.get("name"),
                                 "cmdline": sanitized_cmdline(cmdline),
                                 "signal_environment_keys": signal_env_keys,
-                                "matched_heuristics": [rule.value for rule in rules],
-                                "classification": (
-                                    {
-                                        "agent_type": agent_type.value,
-                                        "detection_rule": detection_rule.value,
-                                    }
-                                    if agent_type
-                                    else None
-                                ),
+                                "matched_heuristics": [
+                                    rule.value for rule in detection.matched_heuristics
+                                ],
+                                "classification": {
+                                    "agent_type": detection.agent_type.value,
+                                    "detection_rule": detection.detection_rule.value,
+                                },
                             },
                             sort_keys=True,
                         )
@@ -374,10 +361,11 @@ class AIAgentCollector:
                     proc_info["environ"] = {}
 
                 # Determine if process is an AI agent process
-                agent_type, detection_rule = detect_agent(proc_info)
-                if not agent_type:
+                detection = detect_agent(proc_info)
+                if detection is None:
                     continue
-                assert detection_rule is not None
+                agent_type = detection.agent_type
+                detection_rule = detection.detection_rule
 
                 user: str = get_username(uid)
 
