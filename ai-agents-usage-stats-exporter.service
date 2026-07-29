@@ -1,0 +1,13 @@
+[Unit]
+Description=AI Agents Usage Stats Prometheus Exporter for Slurm Login Nodes
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/sysconfig/ai-agents-usage-stats-exporter
+ExecStart=/usr/local/bin/ai-agents-usage-stats-exporter --port 9799
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

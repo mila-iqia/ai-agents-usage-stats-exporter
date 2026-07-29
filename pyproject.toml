@@ -1,0 +1,25 @@
+[project]
+name = "ai-agents-usage-stats-exporter"
+version = "0.1.0"
+description = "Prometheus exporter for tracking AI agent usage on Slurm login nodes"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "prometheus-client>=0.16.0",
+    "psutil>=5.9.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+ai-agents-usage-stats-exporter = "ai_agents_usage_stats_exporter:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
