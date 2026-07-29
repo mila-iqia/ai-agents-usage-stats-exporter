@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
-from typing import Any, Generator, NamedTuple, Pattern, TypedDict
+from typing import Any, Iterable, NamedTuple, Pattern, TypedDict
 from wsgiref.simple_server import WSGIRequestHandler, make_server
 
 import psutil
@@ -80,20 +80,6 @@ class DetectionResult(NamedTuple):
     matched_heuristics: tuple[DetectionRule, ...]
 
 
-@lru_cache(maxsize=200)
-def get_username(uid: int) -> str:
-    """
-    Convert a numerical POSIX UID to a human-readable username using `/usr/bin/id`.
-    Results are cached in memory to minimize subshell invocation overhead.
-    """
-    try:
-        command: list[str] = ["/usr/bin/id", "--name", "--user", str(uid)]
-        return subprocess.check_output(command, stderr=subprocess.DEVNULL).strip().decode()
-    except Exception:
-        # Fallback to string UID if user resolution fails or UID is ephemeral
-        return f"uid_{uid}"
-
-
 # Signatures for direct agent executables, CLI packages, or module invocations.
 # Each entry maps a typed agent identity to a regex matched against name, exe, or cmdline.
 KNOWN_AGENT_SIGNATURES: list[tuple[AgentType, Pattern[str]]] = [
@@ -145,6 +131,187 @@ REMOTE_AGENT_CMD_PATTERNS: list[Pattern[str]] = [
 SENSITIVE_ARGUMENT_RE: Pattern[str] = re.compile(
     r"(?i)(api[_-]?key|token|password|passwd|secret|authorization)(=|:)[^\s]+"
 )
+
+
+class AIAgentCollector:
+    """
+    Custom Prometheus Collector for login node AI agent usage.
+
+    Scans the system process table on demand during Prometheus scrape requests,
+    aggregating CPU, RSS memory, process counts, thread counts, and active user metrics.
+    """
+
+    def collect(self) -> Iterable[Metric]:
+        """Scans system processes and yields Prometheus Metric objects."""
+        yield from collect_metrics()
+
+
+def collect_metrics() -> Iterable[Metric]:
+    """Scans system processes and yields Prometheus Metric objects."""
+    start_time = time.time()
+
+    # Initialize Prometheus Metric Families
+    metrics = {
+        "process_count": GaugeMetricFamily(
+            "ai_agent_process_count",
+            "Number of active AI agent processes running on the login node",
+            labels=["user", "agent_type", "detection_rule"],
+        ),
+        "memory_rss": GaugeMetricFamily(
+            "ai_agent_memory_rss_bytes",
+            "Resident set size memory used by AI agent processes in bytes",
+            labels=["user", "agent_type", "detection_rule"],
+        ),
+        "cpu_usage": CounterMetricFamily(
+            "ai_agent_cpu_usage_seconds_total",
+            "Total CPU time consumed by AI agent processes in seconds",
+            labels=["user", "agent_type", "detection_rule"],
+        ),
+        "threads_count": GaugeMetricFamily(
+            "ai_agent_threads_count",
+            "Total number of threads spawned by AI agent processes",
+            labels=["user", "agent_type", "detection_rule"],
+        ),
+        "agent_active_users": GaugeMetricFamily(
+            "ai_agent_active_users",
+            "Count of distinct active users using a specific AI agent type",
+            labels=["agent_type", "detection_rule"],
+        ),
+        "login_node_active_users_total": GaugeMetricFamily(
+            "login_node_active_users_total",
+            "Total count of unique active users logged into or running processes on the login node",
+        ),
+        "scrape_duration": GaugeMetricFamily(
+            "ai_agent_exporter_scrape_duration_seconds",
+            "Time spent collecting AI agent statistics in seconds",
+        ),
+    }
+
+    # Aggregation tracking structures
+    agent_stats: dict[tuple[str, AgentType, DetectionRule], AgentResourceStats] = {}
+    agent_users: dict[tuple[AgentType, DetectionRule], set[str]] = {}
+    active_uids: set[int] = set()
+
+    # Iterate over all running system processes retrieving key attributes in a single pass
+    for proc in psutil.process_iter(attrs=["pid", "uids", "name", "exe", "cmdline"]):
+        try:
+            proc_info: ProcInfo = proc.info  # type: ignore[assignment]
+            uids: Any = proc_info.get("uids")
+            uid: int | None = uids.real if uids else None
+
+            # Fallback UID lookup if process_iter attribute was unavailable
+            if uid is None:
+                try:
+                    uid = proc.uids().real
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+
+            # Filter user processes (UID >= 500 for standard Linux user account threshold)
+            if uid >= 500:
+                active_uids.add(uid)
+
+            # Attempt to retrieve environment variables (may fail due to OS permissions for other users)
+            try:
+                proc_info["environ"] = proc.environ()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                proc_info["environ"] = {}
+
+            # Determine if process is an AI agent process
+            detection = detect_agent(proc_info)
+            if detection is None:
+                continue
+            agent_type = detection.agent_type
+            detection_rule = detection.detection_rule
+
+            user: str = get_username(uid)
+
+            # Collect memory usage (RSS in bytes)
+            try:
+                mem_rss: int = proc.memory_info().rss
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                mem_rss = 0
+
+            # Collect CPU times (user + system mode seconds)
+            try:
+                cpu_times: Any = proc.cpu_times()
+                cpu_total: float = cpu_times.user + cpu_times.system
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                cpu_total = 0.0
+
+            # Collect thread counts
+            try:
+                num_threads: int = proc.num_threads()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                num_threads = 1
+
+            # Aggregate metrics by (user, agent_type)
+            key: tuple[str, AgentType, DetectionRule] = (user, agent_type, detection_rule)
+            if key not in agent_stats:
+                agent_stats[key] = {
+                    "process_count": 0,
+                    "memory_rss": 0,
+                    "cpu_usage": 0.0,
+                    "threads_count": 0,
+                }
+
+            agent_stats[key]["process_count"] += 1
+            agent_stats[key]["memory_rss"] += mem_rss
+            agent_stats[key]["cpu_usage"] += cpu_total
+            agent_stats[key]["threads_count"] += num_threads
+
+            agent_user_key = (agent_type, detection_rule)
+            if agent_user_key not in agent_users:
+                agent_users[agent_user_key] = set()
+            agent_users[agent_user_key].add(user)
+
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            # Process exited during iteration or access was denied by OS security policy
+            continue
+
+    # Include active logged-in terminal sessions from system utmp/wtmp
+    try:
+        for u in psutil.users():
+            if u.name:
+                pass
+    except Exception:
+        pass
+
+    # Populate metrics for each (user, agent_type) group
+    for (user, agent_type, detection_rule), stats in agent_stats.items():
+        labels = [user, agent_type.value, detection_rule.value]
+        metrics["process_count"].add_metric(labels, stats["process_count"])
+        metrics["memory_rss"].add_metric(labels, stats["memory_rss"])
+        metrics["cpu_usage"].add_metric(labels, stats["cpu_usage"])
+        metrics["threads_count"].add_metric(labels, stats["threads_count"])
+
+    # Populate active user counts per agent type
+    for (agent_type, detection_rule), users in agent_users.items():
+        metrics["agent_active_users"].add_metric(
+            [agent_type.value, detection_rule.value], len(users)
+        )
+
+    # Total unique active users on login node (denominator metric for percentage calculations)
+    metrics["login_node_active_users_total"].add_metric([], len(active_uids))
+
+    # Record scrape duration self-monitoring metric
+    duration: float = time.time() - start_time
+    metrics["scrape_duration"].add_metric([], duration)
+
+    yield from metrics.values()
+
+
+@lru_cache(maxsize=200)
+def get_username(uid: int) -> str:
+    """
+    Convert a numerical POSIX UID to a human-readable username using `/usr/bin/id`.
+    Results are cached in memory to minimize subshell invocation overhead.
+    """
+    try:
+        command: list[str] = ["/usr/bin/id", "--name", "--user", str(uid)]
+        return subprocess.check_output(command, stderr=subprocess.DEVNULL).strip().decode()
+    except Exception:
+        # Fallback to string UID if user resolution fails or UID is ephemeral
+        return f"uid_{uid}"
 
 
 def detect_agent(proc_info: ProcInfo) -> DetectionResult | None:
@@ -280,168 +447,6 @@ def observe_processes(duration: float, interval: float, output_path: str) -> int
                     continue
             time.sleep(interval)
     return records
-
-
-class AIAgentCollector:
-    """
-    Custom Prometheus Collector for login node AI agent usage.
-
-    Scans the system process table on demand during Prometheus scrape requests,
-    aggregating CPU, RSS memory, process counts, thread counts, and active user metrics.
-    """
-
-    def collect(self) -> Generator[Metric, None, None]:
-        """Scans system processes and yields Prometheus Metric objects."""
-        start_time: float = time.time()
-
-        # Initialize Prometheus Metric Families
-        metrics: dict[str, Metric] = {
-            "process_count": GaugeMetricFamily(
-                "ai_agent_process_count",
-                "Number of active AI agent processes running on the login node",
-                labels=["user", "agent_type", "detection_rule"],
-            ),
-            "memory_rss": GaugeMetricFamily(
-                "ai_agent_memory_rss_bytes",
-                "Resident set size memory used by AI agent processes in bytes",
-                labels=["user", "agent_type", "detection_rule"],
-            ),
-            "cpu_usage": CounterMetricFamily(
-                "ai_agent_cpu_usage_seconds_total",
-                "Total CPU time consumed by AI agent processes in seconds",
-                labels=["user", "agent_type", "detection_rule"],
-            ),
-            "threads_count": GaugeMetricFamily(
-                "ai_agent_threads_count",
-                "Total number of threads spawned by AI agent processes",
-                labels=["user", "agent_type", "detection_rule"],
-            ),
-            "agent_active_users": GaugeMetricFamily(
-                "ai_agent_active_users",
-                "Count of distinct active users using a specific AI agent type",
-                labels=["agent_type", "detection_rule"],
-            ),
-            "login_node_active_users_total": GaugeMetricFamily(
-                "login_node_active_users_total",
-                "Total count of unique active users logged into or running processes on the login node",
-            ),
-            "scrape_duration": GaugeMetricFamily(
-                "ai_agent_exporter_scrape_duration_seconds",
-                "Time spent collecting AI agent statistics in seconds",
-            ),
-        }
-
-        # Aggregation tracking structures
-        agent_stats: dict[tuple[str, AgentType, DetectionRule], AgentResourceStats] = {}
-        agent_users: dict[tuple[AgentType, DetectionRule], set[str]] = {}
-        active_uids: set[int] = set()
-
-        # Iterate over all running system processes retrieving key attributes in a single pass
-        for proc in psutil.process_iter(attrs=["pid", "uids", "name", "exe", "cmdline"]):
-            try:
-                proc_info: ProcInfo = proc.info  # type: ignore[assignment]
-                uids: Any = proc_info.get("uids")
-                uid: int | None = uids.real if uids else None
-
-                # Fallback UID lookup if process_iter attribute was unavailable
-                if uid is None:
-                    try:
-                        uid = proc.uids().real
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        continue
-
-                # Filter user processes (UID >= 500 for standard Linux user account threshold)
-                if uid is not None and uid >= 500:
-                    active_uids.add(uid)
-
-                # Attempt to retrieve environment variables (may fail due to OS permissions for other users)
-                try:
-                    proc_info["environ"] = proc.environ()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    proc_info["environ"] = {}
-
-                # Determine if process is an AI agent process
-                detection = detect_agent(proc_info)
-                if detection is None:
-                    continue
-                agent_type = detection.agent_type
-                detection_rule = detection.detection_rule
-
-                user: str = get_username(uid)
-
-                # Collect memory usage (RSS in bytes)
-                try:
-                    mem_rss: int = proc.memory_info().rss
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    mem_rss = 0
-
-                # Collect CPU times (user + system mode seconds)
-                try:
-                    cpu_times: Any = proc.cpu_times()
-                    cpu_total: float = cpu_times.user + cpu_times.system
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    cpu_total = 0.0
-
-                # Collect thread counts
-                try:
-                    num_threads: int = proc.num_threads()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    num_threads = 1
-
-                # Aggregate metrics by (user, agent_type)
-                key: tuple[str, AgentType, DetectionRule] = (user, agent_type, detection_rule)
-                if key not in agent_stats:
-                    agent_stats[key] = {
-                        "process_count": 0,
-                        "memory_rss": 0,
-                        "cpu_usage": 0.0,
-                        "threads_count": 0,
-                    }
-
-                agent_stats[key]["process_count"] += 1
-                agent_stats[key]["memory_rss"] += mem_rss
-                agent_stats[key]["cpu_usage"] += cpu_total
-                agent_stats[key]["threads_count"] += num_threads
-
-                agent_user_key = (agent_type, detection_rule)
-                if agent_user_key not in agent_users:
-                    agent_users[agent_user_key] = set()
-                agent_users[agent_user_key].add(user)
-
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                # Process exited during iteration or access was denied by OS security policy
-                continue
-
-        # Include active logged-in terminal sessions from system utmp/wtmp
-        try:
-            for u in psutil.users():
-                if u.name:
-                    pass
-        except Exception:
-            pass
-
-        # Populate metrics for each (user, agent_type) group
-        for (user, agent_type, detection_rule), stats in agent_stats.items():
-            labels = [user, agent_type.value, detection_rule.value]
-            metrics["process_count"].add_metric(labels, stats["process_count"])
-            metrics["memory_rss"].add_metric(labels, stats["memory_rss"])
-            metrics["cpu_usage"].add_metric(labels, stats["cpu_usage"])
-            metrics["threads_count"].add_metric(labels, stats["threads_count"])
-
-        # Populate active user counts per agent type
-        for (agent_type, detection_rule), users in agent_users.items():
-            metrics["agent_active_users"].add_metric(
-                [agent_type.value, detection_rule.value], len(users)
-            )
-
-        # Total unique active users on login node (denominator metric for percentage calculations)
-        metrics["login_node_active_users_total"].add_metric([], len(active_uids))
-
-        # Record scrape duration self-monitoring metric
-        duration: float = time.time() - start_time
-        metrics["scrape_duration"].add_metric([], duration)
-
-        yield from metrics.values()
 
 
 class NoLoggingWSGIRequestHandler(WSGIRequestHandler):

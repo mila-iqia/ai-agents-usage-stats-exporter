@@ -28,7 +28,7 @@ Prometheus exporter for tracking AI coding agent usage (e.g., Claude Code, Aider
 ### Installation & Environment Setup
 
 ```bash
-git clone https://github.com/lebrice/ai-agents-usage-stats-exporter.git
+git clone https://github.com/mila-iqia/ai-agents-usage-stats-exporter.git
 cd ai-agents-usage-stats-exporter
 
 # Install dependencies and sync virtual environment
