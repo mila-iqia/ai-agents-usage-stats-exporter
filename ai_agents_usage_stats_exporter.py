@@ -10,19 +10,20 @@ metrics (CPU, memory, threads, process counts, user counts) to Prometheus.
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import subprocess
 import time
-from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
-from typing import Any, Iterable, NamedTuple, Pattern, TypedDict
+from typing import Any, Iterable, NamedTuple, TypedDict
 from wsgiref.simple_server import WSGIRequestHandler, make_server
 
 import psutil
 from prometheus_client import make_wsgi_app
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
+from typing_extensions import NewType
+
+UsernameOrUID = NewType("UsernameOrUID", str)
 
 
 class ProcInfo(TypedDict, total=False):
@@ -43,6 +44,18 @@ class AgentResourceStats(TypedDict):
     memory_rss: int
     cpu_usage: float
     threads_count: int
+
+
+class PrometheusMetrics(TypedDict):
+    """Typed mapping of all metric families emitted by collect_metrics."""
+
+    process_count: GaugeMetricFamily
+    memory_rss: GaugeMetricFamily
+    cpu_usage: CounterMetricFamily
+    threads_count: GaugeMetricFamily
+    agent_active_users: GaugeMetricFamily
+    login_node_active_users_total: GaugeMetricFamily
+    scrape_duration: GaugeMetricFamily
 
 
 class AgentType(str, Enum):
@@ -82,7 +95,7 @@ class DetectionResult(NamedTuple):
 
 # Signatures for direct agent executables, CLI packages, or module invocations.
 # Each entry maps a typed agent identity to a regex matched against name, exe, or cmdline.
-KNOWN_AGENT_SIGNATURES: list[tuple[AgentType, Pattern[str]]] = [
+KNOWN_AGENT_SIGNATURES = [
     # OpenAI Codex CLI (e.g. `codex`, `codex exec`)
     (AgentType.CODEX, re.compile(r"(^|/|\s)(codex)($|\s|/)", re.IGNORECASE)),
     # Claude Code CLI (e.g. `claude`, `@anthropic-ai/claude-code`, `claude-code`)
@@ -122,15 +135,10 @@ KNOWN_AGENT_SIGNATURES: list[tuple[AgentType, Pattern[str]]] = [
 
 # Heuristic patterns for detecting SSH-invoked remote agent subshell execution:
 # Remote agents executing shell commands over SSH typically invoke subshells with heavy stderr redirections.
-REMOTE_SUBSHELL_REDIRECTION_RE: Pattern[str] = re.compile(
-    r"2>/dev/null|2>&1\s*>/dev/null|> /tmp/\S+ 2>&1"
-)
-REMOTE_AGENT_CMD_PATTERNS: list[Pattern[str]] = [
+REMOTE_SUBSHELL_REDIRECTION_RE = re.compile(r"2>/dev/null|2>&1\s*>/dev/null|> /tmp/\S+ 2>&1")
+REMOTE_AGENT_CMD_PATTERNS = [
     re.compile(r"CLAUDE_CODE|ANTHROPIC_API_KEY|AIDER_|OPENHANDS_", re.IGNORECASE),
 ]
-SENSITIVE_ARGUMENT_RE: Pattern[str] = re.compile(
-    r"(?i)(api[_-]?key|token|password|passwd|secret|authorization)(=|:)[^\s]+"
-)
 
 
 class AIAgentCollector:
@@ -151,7 +159,7 @@ def collect_metrics() -> Iterable[Metric]:
     start_time = time.time()
 
     # Initialize Prometheus Metric Families
-    metrics = {
+    metrics: PrometheusMetrics = {
         "process_count": GaugeMetricFamily(
             "ai_agent_process_count",
             "Number of active AI agent processes running on the login node",
@@ -188,8 +196,8 @@ def collect_metrics() -> Iterable[Metric]:
     }
 
     # Aggregation tracking structures
-    agent_stats: dict[tuple[str, AgentType, DetectionRule], AgentResourceStats] = {}
-    agent_users: dict[tuple[AgentType, DetectionRule], set[str]] = {}
+    agent_stats: dict[tuple[UsernameOrUID, AgentType, DetectionRule], AgentResourceStats] = {}
+    agent_users: dict[tuple[AgentType, DetectionRule], set[UsernameOrUID]] = {}
     active_uids: set[int] = set()
 
     # Iterate over all running system processes retrieving key attributes in a single pass
@@ -223,7 +231,7 @@ def collect_metrics() -> Iterable[Metric]:
             agent_type = detection.agent_type
             detection_rule = detection.detection_rule
 
-            user: str = get_username(uid)
+            user = UsernameOrUID(get_username(uid))
 
             # Collect memory usage (RSS in bytes)
             try:
@@ -245,7 +253,7 @@ def collect_metrics() -> Iterable[Metric]:
                 num_threads = 1
 
             # Aggregate metrics by (user, agent_type)
-            key: tuple[str, AgentType, DetectionRule] = (user, agent_type, detection_rule)
+            key = (user, agent_type, detection_rule)
             if key not in agent_stats:
                 agent_stats[key] = {
                     "process_count": 0,
@@ -268,14 +276,6 @@ def collect_metrics() -> Iterable[Metric]:
             # Process exited during iteration or access was denied by OS security policy
             continue
 
-    # Include active logged-in terminal sessions from system utmp/wtmp
-    try:
-        for u in psutil.users():
-            if u.name:
-                pass
-    except Exception:
-        pass
-
     # Populate metrics for each (user, agent_type) group
     for (user, agent_type, detection_rule), stats in agent_stats.items():
         labels = [user, agent_type.value, detection_rule.value]
@@ -297,7 +297,16 @@ def collect_metrics() -> Iterable[Metric]:
     duration: float = time.time() - start_time
     metrics["scrape_duration"].add_metric([], duration)
 
-    yield from metrics.values()
+    emitted_metrics: tuple[Metric, ...] = (
+        metrics["process_count"],
+        metrics["memory_rss"],
+        metrics["cpu_usage"],
+        metrics["threads_count"],
+        metrics["agent_active_users"],
+        metrics["login_node_active_users_total"],
+        metrics["scrape_duration"],
+    )
+    yield from emitted_metrics
 
 
 @lru_cache(maxsize=200)
@@ -375,80 +384,6 @@ def detect_agent(proc_info: ProcInfo) -> DetectionResult | None:
     return DetectionResult(*selected, tuple(matched_rules))
 
 
-def sanitized_cmdline(cmdline: list[str]) -> list[str]:
-    """Redact common inline secret assignments before writing an observation file."""
-    return [SENSITIVE_ARGUMENT_RE.sub(r"\1\2[REDACTED]", argument) for argument in cmdline]
-
-
-def observe_processes(duration: float, interval: float, output_path: str) -> int:
-    """Write one JSON record per candidate process seen during a bounded observation window."""
-    seen: set[tuple[int, tuple[str, ...], tuple[DetectionRule, ...]]] = set()
-    deadline = time.monotonic() + duration
-    records = 0
-    with open(output_path, "w", encoding="utf-8") as output:
-        while time.monotonic() < deadline:
-            for proc in psutil.process_iter(
-                attrs=["pid", "ppid", "uids", "name", "exe", "cmdline"]
-            ):
-                try:
-                    proc_info: ProcInfo = proc.info  # type: ignore[assignment]
-                    try:
-                        proc_info["environ"] = proc.environ()
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        proc_info["environ"] = {}
-                    detection = detect_agent(proc_info)
-                    if detection is None:
-                        continue
-                    pid = proc_info.get("pid", proc.pid)
-                    cmdline = proc_info.get("cmdline") or []
-                    identity = (pid, tuple(cmdline), detection.matched_heuristics)
-                    if identity in seen:
-                        continue
-                    seen.add(identity)
-                    uids = proc_info.get("uids")
-                    uid = uids.real if uids else proc.uids().real
-                    signal_env_keys = sorted(
-                        key
-                        for key in proc_info["environ"]
-                        if key
-                        in {
-                            "SSH_CONNECTION",
-                            "SSH_TTY",
-                            "CLAUDE_CODE_ENTRYPOINT",
-                            "CLAUDE_SESSION_ID",
-                            "CURSOR_TRACE",
-                        }
-                        or key.startswith("AIDER_")
-                    )
-                    output.write(
-                        json.dumps(
-                            {
-                                "observed_at": datetime.now(timezone.utc).isoformat(),
-                                "pid": pid,
-                                "ppid": proc_info.get("ppid"),
-                                "user": get_username(uid),
-                                "name": proc_info.get("name"),
-                                "cmdline": sanitized_cmdline(cmdline),
-                                "signal_environment_keys": signal_env_keys,
-                                "matched_heuristics": [
-                                    rule.value for rule in detection.matched_heuristics
-                                ],
-                                "classification": {
-                                    "agent_type": detection.agent_type.value,
-                                    "detection_rule": detection.detection_rule.value,
-                                },
-                            },
-                            sort_keys=True,
-                        )
-                        + "\n"
-                    )
-                    records += 1
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-            time.sleep(interval)
-    return records
-
-
 class NoLoggingWSGIRequestHandler(WSGIRequestHandler):
     """Custom WSGI request handler that suppresses routine HTTP access logs for clean stdout."""
 
@@ -468,33 +403,7 @@ def main() -> None:
         default=default_port,
         help=f"Collector HTTP port, default is {default_port}",
     )
-    parser.add_argument(
-        "--observe-processes",
-        type=float,
-        metavar="SECONDS",
-        help="Sample candidate process heuristics for this duration instead of serving metrics.",
-    )
-    parser.add_argument(
-        "--observation-output",
-        default="ai-agent-process-observations.jsonl",
-        help="JSONL output path used with --observe-processes.",
-    )
-    parser.add_argument(
-        "--sample-interval",
-        type=float,
-        default=1.0,
-        help="Seconds between observation samples (default: 1).",
-    )
     args: argparse.Namespace = parser.parse_args()
-
-    if args.observe_processes is not None:
-        if args.observe_processes <= 0 or args.sample_interval <= 0:
-            parser.error("--observe-processes and --sample-interval must be positive")
-        records = observe_processes(
-            args.observe_processes, args.sample_interval, args.observation_output
-        )
-        print(f"Wrote {records} candidate process observations to {args.observation_output}")
-        return
 
     app = make_wsgi_app(AIAgentCollector())
     httpd = make_server("", args.port, app, handler_class=NoLoggingWSGIRequestHandler)

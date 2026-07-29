@@ -16,7 +16,6 @@ Prometheus exporter for tracking AI coding agent usage (e.g., Claude Code, Aider
   - Continue (`continue-server`)
 - **Remote Agent & Heuristic Matcher**: Detects SSH-invoked remote agent subshells (pattern matching on stderr redirections like `2>/dev/null` combined with agent context).
 - **Transparent Remote SSH Heuristics**: Resource metrics include a `detection_rule` label. For example, `ssh:agent_signature` identifies a known agent launched over SSH and `ssh:noninteractive_command` identifies a non-interactive SSH command without agent-specific evidence. The latter is intentionally a low-confidence heuristic, so dashboards can include or exclude it explicitly.
-- **Heuristic Observation Mode**: `--observe-processes 120 --observation-output observations.jsonl` samples candidate processes for two minutes. Each JSONL record includes the selected classification and all matching heuristic codes (for example `ssh:stderr_redirection`); environment values are never recorded and common inline secrets are redacted from command lines.
 - **Resource Usage Metrics**: Tracks process count, RSS memory bytes, CPU time, and thread count per user and per agent type.
 - **Login Node Denominator Metric**: Exposes `login_node_active_users_total` (total unique active users on the login node) so Prometheus/Grafana can compute the percentage of active users utilizing AI agents.
 - **Lightweight & Fast**: Pure Python WSGI HTTP server with zero heavy web framework dependencies.
@@ -55,28 +54,33 @@ uv run pytest
 ```prometheus
 # HELP ai_agent_process_count Number of active AI agent processes running on the login node
 # TYPE ai_agent_process_count gauge
-ai_agent_process_count{agent_type="claude",user="alice"} 3.0
-ai_agent_process_count{agent_type="aider",user="bob"} 1.0
+ai_agent_process_count{agent_type="claude",detection_rule="cmdline:agent_signature",user="alice"} 3.0
+ai_agent_process_count{agent_type="codex",detection_rule="cmdline:agent_signature",user="bob"} 1.0
+ai_agent_process_count{agent_type="remote_agent",detection_rule="ssh:noninteractive_command",user="carol"} 1.0
 
 # HELP ai_agent_memory_rss_bytes Resident set size memory used by AI agent processes in bytes
 # TYPE ai_agent_memory_rss_bytes gauge
-ai_agent_memory_rss_bytes{agent_type="claude",user="alice"} 4.51583232e+08
-ai_agent_memory_rss_bytes{agent_type="aider",user="bob"} 2.15061248e+08
+ai_agent_memory_rss_bytes{agent_type="claude",detection_rule="cmdline:agent_signature",user="alice"} 4.51583232e+08
+ai_agent_memory_rss_bytes{agent_type="codex",detection_rule="cmdline:agent_signature",user="bob"} 2.15061248e+08
+ai_agent_memory_rss_bytes{agent_type="remote_agent",detection_rule="ssh:noninteractive_command",user="carol"} 1.5429632e+07
 
 # HELP ai_agent_cpu_usage_seconds_total Total CPU time consumed by AI agent processes in seconds
 # TYPE ai_agent_cpu_usage_seconds_total counter
-ai_agent_cpu_usage_seconds_total{agent_type="claude",user="alice"} 142.50
-ai_agent_cpu_usage_seconds_total{agent_type="aider",user="bob"} 35.12
+ai_agent_cpu_usage_seconds_total{agent_type="claude",detection_rule="cmdline:agent_signature",user="alice"} 142.50
+ai_agent_cpu_usage_seconds_total{agent_type="codex",detection_rule="cmdline:agent_signature",user="bob"} 35.12
+ai_agent_cpu_usage_seconds_total{agent_type="remote_agent",detection_rule="ssh:noninteractive_command",user="carol"} 0.01
 
 # HELP ai_agent_threads_count Total number of threads spawned by AI agent processes
 # TYPE ai_agent_threads_count gauge
-ai_agent_threads_count{agent_type="claude",user="alice"} 36.0
-ai_agent_threads_count{agent_type="aider",user="bob"} 12.0
+ai_agent_threads_count{agent_type="claude",detection_rule="cmdline:agent_signature",user="alice"} 36.0
+ai_agent_threads_count{agent_type="codex",detection_rule="cmdline:agent_signature",user="bob"} 12.0
+ai_agent_threads_count{agent_type="remote_agent",detection_rule="ssh:noninteractive_command",user="carol"} 2.0
 
 # HELP ai_agent_active_users Count of distinct active users using a specific AI agent type
 # TYPE ai_agent_active_users gauge
-ai_agent_active_users{agent_type="claude"} 1.0
-ai_agent_active_users{agent_type="aider"} 1.0
+ai_agent_active_users{agent_type="claude",detection_rule="cmdline:agent_signature"} 1.0
+ai_agent_active_users{agent_type="codex",detection_rule="cmdline:agent_signature"} 1.0
+ai_agent_active_users{agent_type="remote_agent",detection_rule="ssh:noninteractive_command"} 1.0
 
 # HELP login_node_active_users_total Total count of unique active users logged into or running processes on the login node
 # TYPE login_node_active_users_total gauge

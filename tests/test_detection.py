@@ -8,15 +8,16 @@ remote agent subshell heuristics, non-agent filtering, and metric family output.
 from __future__ import annotations
 
 from typing import Any
+
 import pytest
+
 from ai_agents_usage_stats_exporter import (
-    AIAgentCollector,
     AgentType,
+    AIAgentCollector,
     DetectionResult,
     DetectionRule,
     ProcInfo,
     detect_agent,
-    sanitized_cmdline,
 )
 
 
@@ -98,14 +99,6 @@ def test_remote_subshell_heuristics() -> None:
         DetectionRule.SSH_STDERR_REDIRECTION,
         (DetectionRule.SSH_STDERR_REDIRECTION,),
     )
-
-
-def test_sanitized_cmdline_redacts_inline_secrets() -> None:
-    assert sanitized_cmdline(["tool", "api_key=abc123", "--safe"]) == [
-        "tool",
-        "api_key=[REDACTED]",
-        "--safe",
-    ]
 
 
 def test_non_agent_process() -> None:
