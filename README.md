@@ -5,6 +5,7 @@ Prometheus exporter for tracking AI coding agent usage (e.g., Claude Code, Aider
 ## Features
 
 - **Multi-Agent Process Detection**: Detects direct agent executables, Node/Python modules, and environment flags for popular AI coding agents:
+  - OpenAI Codex (`codex`)
   - Claude Code (`claude`, `@anthropic-ai/claude-code`)
   - Aider (`aider`)
   - Cursor Server (`cursor-server`, `cursor`)
@@ -14,6 +15,7 @@ Prometheus exporter for tracking AI coding agent usage (e.g., Claude Code, Aider
   - Antigravity / Gemini CLI (`antigravity`)
   - Continue (`continue-server`)
 - **Remote Agent & Heuristic Matcher**: Detects SSH-invoked remote agent subshells (pattern matching on stderr redirections like `2>/dev/null` combined with agent context).
+- **Remote SSH Attribution**: Resource metrics include `detection_source="direct"`, `"remote"`, or `"remote_ssh"`. Remote launchers can explicitly mark a command without classifying ordinary SSH use as AI activity: `AI_AGENTS_USAGE_EXPORTER_AGENT_TYPE=codex <command>`.
 - **Resource Usage Metrics**: Tracks process count, RSS memory bytes, CPU time, and thread count per user and per agent type.
 - **Login Node Denominator Metric**: Exposes `login_node_active_users_total` (total unique active users on the login node) so Prometheus/Grafana can compute the percentage of active users utilizing AI agents.
 - **Lightweight & Fast**: Pure Python WSGI HTTP server with zero heavy web framework dependencies.

@@ -16,6 +16,7 @@ from ai_agents_usage_stats_exporter import AIAgentCollector, ProcInfo, detect_ag
     "proc_info, expected",
     [
         ({"name": "claude", "cmdline": ["claude"]}, ("claude", False)),
+        ({"name": "codex", "cmdline": ["codex", "exec"]}, ("codex", False)),
         (
             {"name": "node", "cmdline": ["node", "/path/to/@anthropic-ai/claude-code/cli.js"]},
             ("claude", False),
@@ -53,6 +54,19 @@ def test_environment_variable_detection() -> None:
         "environ": {"AIDER_MODEL": "claude-3-5-sonnet"},
     }
     assert detect_agent_type(proc_info_aider) == ("aider", True)
+
+
+def test_explicit_remote_ssh_agent_marker() -> None:
+    """Only an explicitly marked SSH command is categorized as remote SSH agent use."""
+    proc_info: ProcInfo = {
+        "name": "sleep",
+        "cmdline": ["sleep", "10"],
+        "environ": {
+            "AI_AGENTS_USAGE_EXPORTER_AGENT_TYPE": "codex",
+            "SSH_CONNECTION": "192.0.2.1 22 192.0.2.2 12345",
+        },
+    }
+    assert detect_agent_type(proc_info) == ("codex", True)
 
 
 def test_remote_subshell_heuristics() -> None:

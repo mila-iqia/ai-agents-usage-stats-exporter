@@ -42,6 +42,9 @@ class AgentResourceStats(TypedDict):
     threads_count: int
 
 
+REMOTE_AGENT_TYPE_ENV = "AI_AGENTS_USAGE_EXPORTER_AGENT_TYPE"
+
+
 @lru_cache(maxsize=200)
 def get_username(uid: int) -> str:
     """
@@ -59,6 +62,8 @@ def get_username(uid: int) -> str:
 # Signatures for direct agent executables, CLI packages, or module invocations.
 # Each entry maps an agent identifier string to a regex pattern matched against name, exe, or cmdline.
 KNOWN_AGENT_PATTERNS: list[tuple[str, Pattern[str]]] = [
+    # OpenAI Codex CLI (e.g. `codex`, `codex exec`)
+    ("codex", re.compile(r"(^|/|\s)(codex)($|\s|/)", re.IGNORECASE)),
     # Claude Code CLI (e.g. `claude`, `@anthropic-ai/claude-code`, `claude-code`)
     (
         "claude",
@@ -125,6 +130,12 @@ def detect_agent_type(proc_info: ProcInfo) -> tuple[str | None, bool]:
 
     # Step 2: Inspect process environment variables if accessible
     envs: dict[str, str] = proc_info.get("environ") or {}
+    # Remote agent launchers can explicitly propagate their identity over SSH.
+    # This avoids incorrectly treating every non-interactive SSH command as AI use.
+    marked_agent_type = envs.get(REMOTE_AGENT_TYPE_ENV, "").lower()
+    known_agent_types = {agent_type for agent_type, _ in KNOWN_AGENT_PATTERNS}
+    if marked_agent_type in known_agent_types and "SSH_CONNECTION" in envs:
+        return marked_agent_type, True
     if any(k in envs for k in ("CLAUDE_CODE_ENTRYPOINT", "CLAUDE_SESSION_ID")):
         return "claude", True
     if any(k.startswith("AIDER_") for k in envs):
@@ -158,27 +169,27 @@ class AIAgentCollector:
             "process_count": GaugeMetricFamily(
                 "ai_agent_process_count",
                 "Number of active AI agent processes running on the login node",
-                labels=["user", "agent_type"],
+                labels=["user", "agent_type", "detection_source"],
             ),
             "memory_rss": GaugeMetricFamily(
                 "ai_agent_memory_rss_bytes",
                 "Resident set size memory used by AI agent processes in bytes",
-                labels=["user", "agent_type"],
+                labels=["user", "agent_type", "detection_source"],
             ),
             "cpu_usage": CounterMetricFamily(
                 "ai_agent_cpu_usage_seconds_total",
                 "Total CPU time consumed by AI agent processes in seconds",
-                labels=["user", "agent_type"],
+                labels=["user", "agent_type", "detection_source"],
             ),
             "threads_count": GaugeMetricFamily(
                 "ai_agent_threads_count",
                 "Total number of threads spawned by AI agent processes",
-                labels=["user", "agent_type"],
+                labels=["user", "agent_type", "detection_source"],
             ),
             "agent_active_users": GaugeMetricFamily(
                 "ai_agent_active_users",
                 "Count of distinct active users using a specific AI agent type",
-                labels=["agent_type"],
+                labels=["agent_type", "detection_source"],
             ),
             "login_node_active_users_total": GaugeMetricFamily(
                 "login_node_active_users_total",
@@ -191,8 +202,8 @@ class AIAgentCollector:
         }
 
         # Aggregation tracking structures
-        agent_stats: dict[tuple[str, str], AgentResourceStats] = {}
-        agent_users: dict[str, set[str]] = {}
+        agent_stats: dict[tuple[str, str, str], AgentResourceStats] = {}
+        agent_users: dict[tuple[str, str], set[str]] = {}
         active_uids: set[int] = set()
 
         # Iterate over all running system processes retrieving key attributes in a single pass
@@ -224,6 +235,14 @@ class AIAgentCollector:
                 if not agent_type:
                     continue
 
+                detection_source = (
+                    "remote_ssh"
+                    if is_remote and "SSH_CONNECTION" in proc_info.get("environ", {})
+                    else "remote"
+                    if is_remote
+                    else "direct"
+                )
+
                 user: str = get_username(uid)
 
                 # Collect memory usage (RSS in bytes)
@@ -246,7 +265,7 @@ class AIAgentCollector:
                     num_threads = 1
 
                 # Aggregate metrics by (user, agent_type)
-                key: tuple[str, str] = (user, agent_type)
+                key: tuple[str, str, str] = (user, agent_type, detection_source)
                 if key not in agent_stats:
                     agent_stats[key] = {
                         "process_count": 0,
@@ -260,9 +279,10 @@ class AIAgentCollector:
                 agent_stats[key]["cpu_usage"] += cpu_total
                 agent_stats[key]["threads_count"] += num_threads
 
-                if agent_type not in agent_users:
-                    agent_users[agent_type] = set()
-                agent_users[agent_type].add(user)
+                agent_user_key = (agent_type, detection_source)
+                if agent_user_key not in agent_users:
+                    agent_users[agent_user_key] = set()
+                agent_users[agent_user_key].add(user)
 
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 # Process exited during iteration or access was denied by OS security policy
@@ -277,15 +297,16 @@ class AIAgentCollector:
             pass
 
         # Populate metrics for each (user, agent_type) group
-        for (user, agent_type), stats in agent_stats.items():
-            metrics["process_count"].add_metric([user, agent_type], stats["process_count"])
-            metrics["memory_rss"].add_metric([user, agent_type], stats["memory_rss"])
-            metrics["cpu_usage"].add_metric([user, agent_type], stats["cpu_usage"])
-            metrics["threads_count"].add_metric([user, agent_type], stats["threads_count"])
+        for (user, agent_type, detection_source), stats in agent_stats.items():
+            labels = [user, agent_type, detection_source]
+            metrics["process_count"].add_metric(labels, stats["process_count"])
+            metrics["memory_rss"].add_metric(labels, stats["memory_rss"])
+            metrics["cpu_usage"].add_metric(labels, stats["cpu_usage"])
+            metrics["threads_count"].add_metric(labels, stats["threads_count"])
 
         # Populate active user counts per agent type
-        for agent_type, users in agent_users.items():
-            metrics["agent_active_users"].add_metric([agent_type], len(users))
+        for (agent_type, detection_source), users in agent_users.items():
+            metrics["agent_active_users"].add_metric([agent_type, detection_source], len(users))
 
         # Total unique active users on login node (denominator metric for percentage calculations)
         metrics["login_node_active_users_total"].add_metric([], len(active_uids))
