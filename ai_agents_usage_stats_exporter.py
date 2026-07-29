@@ -1,3 +1,12 @@
+"""
+Prometheus Exporter for AI Agents Usage Statistics on Slurm Login Nodes.
+
+This exporter scans running processes on multi-user HPC login nodes using `psutil`,
+identifies active AI coding agent sessions (direct CLI binaries, Python/Node modules,
+IDE remote servers, and SSH remote agent subshells), and exports resource consumption
+metrics (CPU, memory, threads, process counts, user counts) to Prometheus.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -14,6 +23,8 @@ from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metri
 
 
 class ProcInfo(TypedDict, total=False):
+    """Data structure representing process attributes retrieved during inspection."""
+
     name: str
     exe: str
     cmdline: list[str]
@@ -23,6 +34,8 @@ class ProcInfo(TypedDict, total=False):
 
 
 class AgentResourceStats(TypedDict):
+    """Aggregated resource usage statistics for a specific (user, agent_type) pair."""
+
     process_count: int
     memory_rss: int
     cpu_usage: float
@@ -31,45 +44,55 @@ class AgentResourceStats(TypedDict):
 
 @lru_cache(maxsize=200)
 def get_username(uid: int) -> str:
-    """Convert a numerical UID to a username."""
+    """
+    Convert a numerical POSIX UID to a human-readable username using `/usr/bin/id`.
+    Results are cached in memory to minimize subshell invocation overhead.
+    """
     try:
         command: list[str] = ["/usr/bin/id", "--name", "--user", str(uid)]
         return subprocess.check_output(command, stderr=subprocess.DEVNULL).strip().decode()
     except Exception:
+        # Fallback to string UID if user resolution fails or UID is ephemeral
         return f"uid_{uid}"
 
 
-# Agent Signatures (Direct binary, package, module, or process name patterns)
+# Signatures for direct agent executables, CLI packages, or module invocations.
+# Each entry maps an agent identifier string to a regex pattern matched against name, exe, or cmdline.
 KNOWN_AGENT_PATTERNS: list[tuple[str, Pattern[str]]] = [
+    # Claude Code CLI (e.g. `claude`, `@anthropic-ai/claude-code`, `claude-code`)
     (
         "claude",
         re.compile(
-            r"(^|/|\s)(claude|claude-code|@anthropic-ai/claude-code)($|\s|/)",
-            re.IGNORECASE,
+            r"(^|/|\s)(claude|claude-code|@anthropic-ai/claude-code)($|\s|/)", re.IGNORECASE
         ),
     ),
+    # Aider AI pair programmer (e.g. `aider`, `python -m aider`)
     (
         "aider",
         re.compile(r"(^|/|\s)(aider|aider-chat)($|\s|/)|python\d*\s+-m\s+aider", re.IGNORECASE),
     ),
+    # Cursor IDE remote server (e.g. `cursor-server`, `.cursor-server/bin/...`)
     (
         "cursor",
         re.compile(r"(^|/|\s)(cursor|cursor-server|\.cursor-server)($|\s|/)", re.IGNORECASE),
     ),
+    # GitHub Copilot CLI / agent backend
     (
         "copilot",
         re.compile(r"(^|/|\s)(copilot|copilot-agent|github-copilot-cli)($|\s|/)", re.IGNORECASE),
     ),
+    # OpenHands / OpenDevin coding agent
     ("openhands", re.compile(r"(^|/|\s)(openhands|opendevin)($|\s|/)", re.IGNORECASE)),
+    # Block Goose AI coding agent
     ("goose", re.compile(r"(^|/|\s)(goose|goose-agent)($|\s|/)", re.IGNORECASE)),
+    # Antigravity / Gemini AI agent tool
     ("antigravity", re.compile(r"(^|/|\s)(antigravity)($|\s|/)", re.IGNORECASE)),
-    (
-        "continue",
-        re.compile(r"(^|/|\s)(continue-server|continue-agent)($|\s|/)", re.IGNORECASE),
-    ),
+    # Continue IDE agent server
+    ("continue", re.compile(r"(^|/|\s)(continue-server|continue-agent)($|\s|/)", re.IGNORECASE)),
 ]
 
-# Remote Agent Subshell Execution Heuristics
+# Heuristic patterns for detecting SSH-invoked remote agent subshell execution:
+# Remote agents executing shell commands over SSH typically invoke subshells with heavy stderr redirections.
 REMOTE_SUBSHELL_REDIRECTION_RE: Pattern[str] = re.compile(
     r"2>/dev/null|2>&1\s*>/dev/null|> /tmp/\S+ 2>&1"
 )
@@ -80,8 +103,13 @@ REMOTE_AGENT_CMD_PATTERNS: list[Pattern[str]] = [
 
 def detect_agent_type(proc_info: ProcInfo) -> tuple[str | None, bool]:
     """
-    Analyzes process info (name, exe, cmdline, envs) to determine if it is an AI agent process.
-    Returns (agent_type, is_remote) or (None, False).
+    Analyzes process metadata (name, executable path, command line, environment)
+    to detect whether a process belongs to a known AI agent tool.
+
+    Returns:
+        tuple[agent_type, is_remote]:
+            - agent_type (str | None): Identified agent identifier (e.g. 'claude', 'aider') or None.
+            - is_remote (bool): True if detected via remote SSH / environment heuristics.
     """
     cmdline: list[str] = proc_info.get("cmdline") or []
     cmdline_str: str = " ".join(cmdline)
@@ -90,12 +118,12 @@ def detect_agent_type(proc_info: ProcInfo) -> tuple[str | None, bool]:
 
     full_search_str: str = f"{name} {exe} {cmdline_str}"
 
-    # 1. Match direct known agent signatures
+    # Step 1: Match against known direct binary and module signatures
     for agent_type, pattern in KNOWN_AGENT_PATTERNS:
         if pattern.search(full_search_str):
             return agent_type, False
 
-    # 2. Check environment variables if available
+    # Step 2: Inspect process environment variables if accessible
     envs: dict[str, str] = proc_info.get("environ") or {}
     if any(k in envs for k in ("CLAUDE_CODE_ENTRYPOINT", "CLAUDE_SESSION_ID")):
         return "claude", True
@@ -104,7 +132,7 @@ def detect_agent_type(proc_info: ProcInfo) -> tuple[str | None, bool]:
     if "CURSOR_TRACE" in envs:
         return "cursor", True
 
-    # 3. Check remote agent subshell execution heuristics
+    # Step 3: Check heuristic subshell redirection patterns for SSH-invoked remote agents
     if REMOTE_SUBSHELL_REDIRECTION_RE.search(cmdline_str):
         for pattern in REMOTE_AGENT_CMD_PATTERNS:
             if pattern.search(cmdline_str) or pattern.search(str(envs)):
@@ -115,14 +143,17 @@ def detect_agent_type(proc_info: ProcInfo) -> tuple[str | None, bool]:
 
 class AIAgentCollector:
     """
-    Prometheus Collector that scans login node processes to gather stats
-    on active AI coding agents and user activity.
+    Custom Prometheus Collector for login node AI agent usage.
+
+    Scans the system process table on demand during Prometheus scrape requests,
+    aggregating CPU, RSS memory, process counts, thread counts, and active user metrics.
     """
 
     def collect(self) -> Generator[Metric, None, None]:
+        """Scans system processes and yields Prometheus Metric objects."""
         start_time: float = time.time()
 
-        # Define Prometheus Metric Families
+        # Initialize Prometheus Metric Families
         metrics: dict[str, Metric] = {
             "process_count": GaugeMetricFamily(
                 "ai_agent_process_count",
@@ -159,54 +190,62 @@ class AIAgentCollector:
             ),
         }
 
+        # Aggregation tracking structures
         agent_stats: dict[tuple[str, str], AgentResourceStats] = {}
         agent_users: dict[str, set[str]] = {}
         active_uids: set[int] = set()
 
+        # Iterate over all running system processes retrieving key attributes in a single pass
         for proc in psutil.process_iter(attrs=["pid", "uids", "name", "exe", "cmdline"]):
             try:
                 proc_info: ProcInfo = proc.info  # type: ignore[assignment]
                 uids: Any = proc_info.get("uids")
                 uid: int | None = uids.real if uids else None
 
+                # Fallback UID lookup if process_iter attribute was unavailable
                 if uid is None:
                     try:
                         uid = proc.uids().real
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         continue
 
-                # Filter user processes (UID >= 500 for standard Linux system user threshold)
+                # Filter user processes (UID >= 500 for standard Linux user account threshold)
                 if uid is not None and uid >= 500:
                     active_uids.add(uid)
 
+                # Attempt to retrieve environment variables (may fail due to OS permissions for other users)
                 try:
                     proc_info["environ"] = proc.environ()
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     proc_info["environ"] = {}
 
+                # Determine if process is an AI agent process
                 agent_type, is_remote = detect_agent_type(proc_info)
                 if not agent_type:
                     continue
 
                 user: str = get_username(uid)
 
-                # Fetch process resource stats
+                # Collect memory usage (RSS in bytes)
                 try:
                     mem_rss: int = proc.memory_info().rss
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     mem_rss = 0
 
+                # Collect CPU times (user + system mode seconds)
                 try:
                     cpu_times: Any = proc.cpu_times()
                     cpu_total: float = cpu_times.user + cpu_times.system
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     cpu_total = 0.0
 
+                # Collect thread counts
                 try:
                     num_threads: int = proc.num_threads()
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     num_threads = 1
 
+                # Aggregate metrics by (user, agent_type)
                 key: tuple[str, str] = (user, agent_type)
                 if key not in agent_stats:
                     agent_stats[key] = {
@@ -226,8 +265,10 @@ class AIAgentCollector:
                 agent_users[agent_type].add(user)
 
             except (psutil.NoSuchProcess, psutil.AccessDenied):
+                # Process exited during iteration or access was denied by OS security policy
                 continue
 
+        # Include active logged-in terminal sessions from system utmp/wtmp
         try:
             for u in psutil.users():
                 if u.name:
@@ -235,20 +276,21 @@ class AIAgentCollector:
         except Exception:
             pass
 
-        # Populate Prometheus metric families
+        # Populate metrics for each (user, agent_type) group
         for (user, agent_type), stats in agent_stats.items():
             metrics["process_count"].add_metric([user, agent_type], stats["process_count"])
             metrics["memory_rss"].add_metric([user, agent_type], stats["memory_rss"])
             metrics["cpu_usage"].add_metric([user, agent_type], stats["cpu_usage"])
             metrics["threads_count"].add_metric([user, agent_type], stats["threads_count"])
 
+        # Populate active user counts per agent type
         for agent_type, users in agent_users.items():
             metrics["agent_active_users"].add_metric([agent_type], len(users))
 
-        # Total unique active users on login node
+        # Total unique active users on login node (denominator metric for percentage calculations)
         metrics["login_node_active_users_total"].add_metric([], len(active_uids))
 
-        # Scrape duration
+        # Record scrape duration self-monitoring metric
         duration: float = time.time() - start_time
         metrics["scrape_duration"].add_metric([], duration)
 
@@ -256,21 +298,23 @@ class AIAgentCollector:
 
 
 class NoLoggingWSGIRequestHandler(WSGIRequestHandler):
-    """Suppress WSGI HTTP request logging."""
+    """Custom WSGI request handler that suppresses routine HTTP access logs for clean stdout."""
 
     def log_message(self, format: str, *args: Any) -> None:
         pass
 
 
 def main() -> None:
+    """CLI entrypoint for running the Prometheus exporter HTTP daemon."""
     parser: argparse.ArgumentParser = argparse.ArgumentParser(
         description="Prometheus exporter for tracking AI agent usage on Slurm login nodes"
     )
+    default_port = 9799
     parser.add_argument(
         "--port",
         type=int,
-        default=9799,
-        help="Collector HTTP port, default is 9799",
+        default=default_port,
+        help=f"Collector HTTP port, default is {default_port}",
     )
     args: argparse.Namespace = parser.parse_args()
 

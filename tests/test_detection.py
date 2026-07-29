@@ -1,3 +1,10 @@
+"""
+Unit tests for AI Agents Usage Stats Exporter.
+
+Verifies process signature detection logic, environment variable inspection,
+remote agent subshell heuristics, non-agent filtering, and metric family output.
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -10,22 +17,13 @@ from ai_agents_usage_stats_exporter import AIAgentCollector, ProcInfo, detect_ag
     [
         ({"name": "claude", "cmdline": ["claude"]}, ("claude", False)),
         (
-            {
-                "name": "node",
-                "cmdline": ["node", "/path/to/@anthropic-ai/claude-code/cli.js"],
-            },
+            {"name": "node", "cmdline": ["node", "/path/to/@anthropic-ai/claude-code/cli.js"]},
             ("claude", False),
         ),
-        (
-            {"name": "aider", "cmdline": ["aider", "--model", "gpt-4o"]},
-            ("aider", False),
-        ),
+        ({"name": "aider", "cmdline": ["aider", "--model", "gpt-4o"]}, ("aider", False)),
         ({"name": "python3", "cmdline": ["python3", "-m", "aider"]}, ("aider", False)),
         (
-            {
-                "name": "cursor-server",
-                "cmdline": ["/home/user/.cursor-server/bin/cursor-server"],
-            },
+            {"name": "cursor-server", "cmdline": ["/home/user/.cursor-server/bin/cursor-server"]},
             ("cursor", False),
         ),
         ({"name": "copilot-agent", "cmdline": ["copilot-agent"]}, ("copilot", False)),
@@ -35,11 +33,13 @@ from ai_agents_usage_stats_exporter import AIAgentCollector, ProcInfo, detect_ag
     ],
 )
 def test_direct_agent_signatures(proc_info: ProcInfo, expected: tuple[str | None, bool]) -> None:
+    """Test detection of direct AI agent binary names, packages, and module execution patterns."""
     result: tuple[str | None, bool] = detect_agent_type(proc_info)
     assert result == expected
 
 
 def test_environment_variable_detection() -> None:
+    """Test detection of AI agents based on environment variable flags."""
     proc_info: ProcInfo = {
         "name": "python",
         "cmdline": ["python", "script.py"],
@@ -56,6 +56,7 @@ def test_environment_variable_detection() -> None:
 
 
 def test_remote_subshell_heuristics() -> None:
+    """Test heuristic detection of SSH-invoked subshell calls executed by remote agents."""
     proc_info: ProcInfo = {
         "name": "bash",
         "cmdline": ["bash", "-c", "git status 2>/dev/null"],
@@ -65,6 +66,7 @@ def test_remote_subshell_heuristics() -> None:
 
 
 def test_non_agent_process() -> None:
+    """Ensure standard non-agent user processes return None."""
     proc_info: ProcInfo = {
         "name": "vim",
         "cmdline": ["vim", "file.txt"],
@@ -74,6 +76,7 @@ def test_non_agent_process() -> None:
 
 
 def test_collector_metrics_output() -> None:
+    """Test that AIAgentCollector yields expected Prometheus metric families."""
     collector: AIAgentCollector = AIAgentCollector()
     metrics: list[Any] = list(collector.collect())
     assert len(metrics) > 0
