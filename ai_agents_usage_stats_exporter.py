@@ -10,9 +10,12 @@ metrics (CPU, memory, threads, process counts, user counts) to Prometheus.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import time
+from datetime import datetime, timezone
+from enum import Enum
 from functools import lru_cache
 from typing import Any, Generator, Pattern, TypedDict
 from wsgiref.simple_server import WSGIRequestHandler, make_server
@@ -42,7 +45,31 @@ class AgentResourceStats(TypedDict):
     threads_count: int
 
 
-REMOTE_AGENT_TYPE_ENV = "AI_AGENTS_USAGE_EXPORTER_AGENT_TYPE"
+class AgentType(str, Enum):
+    """Supported AI agent identities used by detection signatures and metrics."""
+
+    CODEX = "codex"
+    CLAUDE = "claude"
+    AIDER = "aider"
+    CURSOR = "cursor"
+    COPILOT = "copilot"
+    OPENHANDS = "openhands"
+    GOOSE = "goose"
+    ANTIGRAVITY = "antigravity"
+    CONTINUE = "continue"
+    REMOTE_AGENT = "remote_agent"
+
+
+class DetectionRule(str, Enum):
+    """Finite set of transparent process-detection heuristics."""
+
+    CMDLINE_AGENT_SIGNATURE = "cmdline:agent_signature"
+    SSH_AGENT_SIGNATURE = "ssh:agent_signature"
+    ENV_CLAUDE = "env:claude"
+    ENV_AIDER = "env:aider"
+    ENV_CURSOR = "env:cursor"
+    SSH_STDERR_REDIRECTION = "ssh:stderr_redirection"
+    SSH_NONINTERACTIVE_COMMAND = "ssh:noninteractive_command"
 
 
 @lru_cache(maxsize=200)
@@ -60,40 +87,43 @@ def get_username(uid: int) -> str:
 
 
 # Signatures for direct agent executables, CLI packages, or module invocations.
-# Each entry maps an agent identifier string to a regex pattern matched against name, exe, or cmdline.
-KNOWN_AGENT_PATTERNS: list[tuple[str, Pattern[str]]] = [
+# Each entry maps a typed agent identity to a regex matched against name, exe, or cmdline.
+KNOWN_AGENT_SIGNATURES: list[tuple[AgentType, Pattern[str]]] = [
     # OpenAI Codex CLI (e.g. `codex`, `codex exec`)
-    ("codex", re.compile(r"(^|/|\s)(codex)($|\s|/)", re.IGNORECASE)),
+    (AgentType.CODEX, re.compile(r"(^|/|\s)(codex)($|\s|/)", re.IGNORECASE)),
     # Claude Code CLI (e.g. `claude`, `@anthropic-ai/claude-code`, `claude-code`)
     (
-        "claude",
+        AgentType.CLAUDE,
         re.compile(
             r"(^|/|\s)(claude|claude-code|@anthropic-ai/claude-code)($|\s|/)", re.IGNORECASE
         ),
     ),
     # Aider AI pair programmer (e.g. `aider`, `python -m aider`)
     (
-        "aider",
+        AgentType.AIDER,
         re.compile(r"(^|/|\s)(aider|aider-chat)($|\s|/)|python\d*\s+-m\s+aider", re.IGNORECASE),
     ),
     # Cursor IDE remote server (e.g. `cursor-server`, `.cursor-server/bin/...`)
     (
-        "cursor",
+        AgentType.CURSOR,
         re.compile(r"(^|/|\s)(cursor|cursor-server|\.cursor-server)($|\s|/)", re.IGNORECASE),
     ),
     # GitHub Copilot CLI / agent backend
     (
-        "copilot",
+        AgentType.COPILOT,
         re.compile(r"(^|/|\s)(copilot|copilot-agent|github-copilot-cli)($|\s|/)", re.IGNORECASE),
     ),
     # OpenHands / OpenDevin coding agent
-    ("openhands", re.compile(r"(^|/|\s)(openhands|opendevin)($|\s|/)", re.IGNORECASE)),
+    (AgentType.OPENHANDS, re.compile(r"(^|/|\s)(openhands|opendevin)($|\s|/)", re.IGNORECASE)),
     # Block Goose AI coding agent
-    ("goose", re.compile(r"(^|/|\s)(goose|goose-agent)($|\s|/)", re.IGNORECASE)),
+    (AgentType.GOOSE, re.compile(r"(^|/|\s)(goose|goose-agent)($|\s|/)", re.IGNORECASE)),
     # Antigravity / Gemini AI agent tool
-    ("antigravity", re.compile(r"(^|/|\s)(antigravity)($|\s|/)", re.IGNORECASE)),
+    (AgentType.ANTIGRAVITY, re.compile(r"(^|/|\s)(antigravity)($|\s|/)", re.IGNORECASE)),
     # Continue IDE agent server
-    ("continue", re.compile(r"(^|/|\s)(continue-server|continue-agent)($|\s|/)", re.IGNORECASE)),
+    (
+        AgentType.CONTINUE,
+        re.compile(r"(^|/|\s)(continue-server|continue-agent)($|\s|/)", re.IGNORECASE),
+    ),
 ]
 
 # Heuristic patterns for detecting SSH-invoked remote agent subshell execution:
@@ -104,52 +134,165 @@ REMOTE_SUBSHELL_REDIRECTION_RE: Pattern[str] = re.compile(
 REMOTE_AGENT_CMD_PATTERNS: list[Pattern[str]] = [
     re.compile(r"CLAUDE_CODE|ANTHROPIC_API_KEY|AIDER_|OPENHANDS_", re.IGNORECASE),
 ]
+SENSITIVE_ARGUMENT_RE: Pattern[str] = re.compile(
+    r"(?i)(api[_-]?key|token|password|passwd|secret|authorization)(=|:)[^\s]+"
+)
 
 
-def detect_agent_type(proc_info: ProcInfo) -> tuple[str | None, bool]:
+def matched_heuristics(proc_info: ProcInfo) -> list[DetectionRule]:
+    """Return every bounded heuristic code matching a process, in priority order."""
+    cmdline = proc_info.get("cmdline") or []
+    cmdline_str = " ".join(cmdline)
+    full_search_str = f"{proc_info.get('name') or ''} {proc_info.get('exe') or ''} {cmdline_str}"
+    envs = proc_info.get("environ") or {}
+    rules: list[DetectionRule] = []
+
+    for agent_type, pattern in KNOWN_AGENT_SIGNATURES:
+        if pattern.search(full_search_str):
+            rules.append(
+                DetectionRule.SSH_AGENT_SIGNATURE
+                if "SSH_CONNECTION" in envs
+                else DetectionRule.CMDLINE_AGENT_SIGNATURE
+            )
+    if any(k in envs for k in ("CLAUDE_CODE_ENTRYPOINT", "CLAUDE_SESSION_ID")):
+        rules.append(DetectionRule.ENV_CLAUDE)
+    if any(k.startswith("AIDER_") for k in envs):
+        rules.append(DetectionRule.ENV_AIDER)
+    if "CURSOR_TRACE" in envs:
+        rules.append(DetectionRule.ENV_CURSOR)
+    if REMOTE_SUBSHELL_REDIRECTION_RE.search(cmdline_str) and any(
+        pattern.search(cmdline_str) or pattern.search(str(envs))
+        for pattern in REMOTE_AGENT_CMD_PATTERNS
+    ):
+        rules.append(DetectionRule.SSH_STDERR_REDIRECTION)
+    if "SSH_CONNECTION" in envs and "SSH_TTY" not in envs:
+        rules.append(DetectionRule.SSH_NONINTERACTIVE_COMMAND)
+    return rules
+
+
+def detect_agent(proc_info: ProcInfo) -> tuple[AgentType | None, DetectionRule | None]:
     """
     Analyzes process metadata (name, executable path, command line, environment)
     to detect whether a process belongs to a known AI agent tool.
 
     Returns:
-        tuple[agent_type, is_remote]:
-            - agent_type (str | None): Identified agent identifier (e.g. 'claude', 'aider') or None.
-            - is_remote (bool): True if detected via remote SSH / environment heuristics.
+        tuple[agent_type, detection_rule]: Identified agent and the transparent rule
+        that triggered detection, or ``(None, None)`` if no rule matches.
     """
     cmdline: list[str] = proc_info.get("cmdline") or []
     cmdline_str: str = " ".join(cmdline)
-    name: str = proc_info.get("name") or ""
-    exe: str = proc_info.get("exe") or ""
-
-    full_search_str: str = f"{name} {exe} {cmdline_str}"
+    envs: dict[str, str] = proc_info.get("environ") or {}
+    rules = matched_heuristics(proc_info)
 
     # Step 1: Match against known direct binary and module signatures
-    for agent_type, pattern in KNOWN_AGENT_PATTERNS:
+    for agent_type, pattern in KNOWN_AGENT_SIGNATURES:
+        full_search_str = (
+            f"{proc_info.get('name') or ''} {proc_info.get('exe') or ''} {cmdline_str}"
+        )
         if pattern.search(full_search_str):
-            return agent_type, False
+            rule = (
+                DetectionRule.SSH_AGENT_SIGNATURE
+                if "SSH_CONNECTION" in envs
+                else DetectionRule.CMDLINE_AGENT_SIGNATURE
+            )
+            return agent_type, rule
 
     # Step 2: Inspect process environment variables if accessible
-    envs: dict[str, str] = proc_info.get("environ") or {}
-    # Remote agent launchers can explicitly propagate their identity over SSH.
-    # This avoids incorrectly treating every non-interactive SSH command as AI use.
-    marked_agent_type = envs.get(REMOTE_AGENT_TYPE_ENV, "").lower()
-    known_agent_types = {agent_type for agent_type, _ in KNOWN_AGENT_PATTERNS}
-    if marked_agent_type in known_agent_types and "SSH_CONNECTION" in envs:
-        return marked_agent_type, True
     if any(k in envs for k in ("CLAUDE_CODE_ENTRYPOINT", "CLAUDE_SESSION_ID")):
-        return "claude", True
+        return AgentType.CLAUDE, DetectionRule.ENV_CLAUDE
     if any(k.startswith("AIDER_") for k in envs):
-        return "aider", True
+        return AgentType.AIDER, DetectionRule.ENV_AIDER
     if "CURSOR_TRACE" in envs:
-        return "cursor", True
+        return AgentType.CURSOR, DetectionRule.ENV_CURSOR
 
     # Step 3: Check heuristic subshell redirection patterns for SSH-invoked remote agents
-    if REMOTE_SUBSHELL_REDIRECTION_RE.search(cmdline_str):
-        for pattern in REMOTE_AGENT_CMD_PATTERNS:
-            if pattern.search(cmdline_str) or pattern.search(str(envs)):
-                return "remote_agent", True
+    if DetectionRule.SSH_STDERR_REDIRECTION in rules:
+        return AgentType.REMOTE_AGENT, DetectionRule.SSH_STDERR_REDIRECTION
 
-    return None, False
+    # SSH does not identify the local program that issued a command.  Treat an
+    # agent-less, non-interactive SSH command as a low-confidence remote-agent
+    # heuristic, but make that fact visible to metric consumers in its rule code.
+    if "SSH_CONNECTION" in envs and "SSH_TTY" not in envs:
+        return AgentType.REMOTE_AGENT, DetectionRule.SSH_NONINTERACTIVE_COMMAND
+
+    return None, None
+
+
+def sanitized_cmdline(cmdline: list[str]) -> list[str]:
+    """Redact common inline secret assignments before writing an observation file."""
+    return [SENSITIVE_ARGUMENT_RE.sub(r"\1\2[REDACTED]", argument) for argument in cmdline]
+
+
+def observe_processes(duration: float, interval: float, output_path: str) -> int:
+    """Write one JSON record per candidate process seen during a bounded observation window."""
+    seen: set[tuple[int, tuple[str, ...], tuple[DetectionRule, ...]]] = set()
+    deadline = time.monotonic() + duration
+    records = 0
+    with open(output_path, "w", encoding="utf-8") as output:
+        while time.monotonic() < deadline:
+            for proc in psutil.process_iter(
+                attrs=["pid", "ppid", "uids", "name", "exe", "cmdline"]
+            ):
+                try:
+                    proc_info: ProcInfo = proc.info  # type: ignore[assignment]
+                    try:
+                        proc_info["environ"] = proc.environ()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        proc_info["environ"] = {}
+                    rules = matched_heuristics(proc_info)
+                    if not rules:
+                        continue
+                    pid = proc_info.get("pid", proc.pid)
+                    cmdline = proc_info.get("cmdline") or []
+                    identity = (pid, tuple(cmdline), tuple(rules))
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    uids = proc_info.get("uids")
+                    uid = uids.real if uids else proc.uids().real
+                    agent_type, detection_rule = detect_agent(proc_info)
+                    signal_env_keys = sorted(
+                        key
+                        for key in proc_info["environ"]
+                        if key
+                        in {
+                            "SSH_CONNECTION",
+                            "SSH_TTY",
+                            "CLAUDE_CODE_ENTRYPOINT",
+                            "CLAUDE_SESSION_ID",
+                            "CURSOR_TRACE",
+                        }
+                        or key.startswith("AIDER_")
+                    )
+                    output.write(
+                        json.dumps(
+                            {
+                                "observed_at": datetime.now(timezone.utc).isoformat(),
+                                "pid": pid,
+                                "ppid": proc_info.get("ppid"),
+                                "user": get_username(uid),
+                                "name": proc_info.get("name"),
+                                "cmdline": sanitized_cmdline(cmdline),
+                                "signal_environment_keys": signal_env_keys,
+                                "matched_heuristics": [rule.value for rule in rules],
+                                "classification": (
+                                    {
+                                        "agent_type": agent_type.value,
+                                        "detection_rule": detection_rule.value,
+                                    }
+                                    if agent_type
+                                    else None
+                                ),
+                            },
+                            sort_keys=True,
+                        )
+                        + "\n"
+                    )
+                    records += 1
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            time.sleep(interval)
+    return records
 
 
 class AIAgentCollector:
@@ -169,27 +312,27 @@ class AIAgentCollector:
             "process_count": GaugeMetricFamily(
                 "ai_agent_process_count",
                 "Number of active AI agent processes running on the login node",
-                labels=["user", "agent_type", "detection_source"],
+                labels=["user", "agent_type", "detection_rule"],
             ),
             "memory_rss": GaugeMetricFamily(
                 "ai_agent_memory_rss_bytes",
                 "Resident set size memory used by AI agent processes in bytes",
-                labels=["user", "agent_type", "detection_source"],
+                labels=["user", "agent_type", "detection_rule"],
             ),
             "cpu_usage": CounterMetricFamily(
                 "ai_agent_cpu_usage_seconds_total",
                 "Total CPU time consumed by AI agent processes in seconds",
-                labels=["user", "agent_type", "detection_source"],
+                labels=["user", "agent_type", "detection_rule"],
             ),
             "threads_count": GaugeMetricFamily(
                 "ai_agent_threads_count",
                 "Total number of threads spawned by AI agent processes",
-                labels=["user", "agent_type", "detection_source"],
+                labels=["user", "agent_type", "detection_rule"],
             ),
             "agent_active_users": GaugeMetricFamily(
                 "ai_agent_active_users",
                 "Count of distinct active users using a specific AI agent type",
-                labels=["agent_type", "detection_source"],
+                labels=["agent_type", "detection_rule"],
             ),
             "login_node_active_users_total": GaugeMetricFamily(
                 "login_node_active_users_total",
@@ -202,8 +345,8 @@ class AIAgentCollector:
         }
 
         # Aggregation tracking structures
-        agent_stats: dict[tuple[str, str, str], AgentResourceStats] = {}
-        agent_users: dict[tuple[str, str], set[str]] = {}
+        agent_stats: dict[tuple[str, AgentType, DetectionRule], AgentResourceStats] = {}
+        agent_users: dict[tuple[AgentType, DetectionRule], set[str]] = {}
         active_uids: set[int] = set()
 
         # Iterate over all running system processes retrieving key attributes in a single pass
@@ -231,17 +374,10 @@ class AIAgentCollector:
                     proc_info["environ"] = {}
 
                 # Determine if process is an AI agent process
-                agent_type, is_remote = detect_agent_type(proc_info)
+                agent_type, detection_rule = detect_agent(proc_info)
                 if not agent_type:
                     continue
-
-                detection_source = (
-                    "remote_ssh"
-                    if is_remote and "SSH_CONNECTION" in proc_info.get("environ", {})
-                    else "remote"
-                    if is_remote
-                    else "direct"
-                )
+                assert detection_rule is not None
 
                 user: str = get_username(uid)
 
@@ -265,7 +401,7 @@ class AIAgentCollector:
                     num_threads = 1
 
                 # Aggregate metrics by (user, agent_type)
-                key: tuple[str, str, str] = (user, agent_type, detection_source)
+                key: tuple[str, AgentType, DetectionRule] = (user, agent_type, detection_rule)
                 if key not in agent_stats:
                     agent_stats[key] = {
                         "process_count": 0,
@@ -279,7 +415,7 @@ class AIAgentCollector:
                 agent_stats[key]["cpu_usage"] += cpu_total
                 agent_stats[key]["threads_count"] += num_threads
 
-                agent_user_key = (agent_type, detection_source)
+                agent_user_key = (agent_type, detection_rule)
                 if agent_user_key not in agent_users:
                     agent_users[agent_user_key] = set()
                 agent_users[agent_user_key].add(user)
@@ -297,16 +433,18 @@ class AIAgentCollector:
             pass
 
         # Populate metrics for each (user, agent_type) group
-        for (user, agent_type, detection_source), stats in agent_stats.items():
-            labels = [user, agent_type, detection_source]
+        for (user, agent_type, detection_rule), stats in agent_stats.items():
+            labels = [user, agent_type.value, detection_rule.value]
             metrics["process_count"].add_metric(labels, stats["process_count"])
             metrics["memory_rss"].add_metric(labels, stats["memory_rss"])
             metrics["cpu_usage"].add_metric(labels, stats["cpu_usage"])
             metrics["threads_count"].add_metric(labels, stats["threads_count"])
 
         # Populate active user counts per agent type
-        for (agent_type, detection_source), users in agent_users.items():
-            metrics["agent_active_users"].add_metric([agent_type, detection_source], len(users))
+        for (agent_type, detection_rule), users in agent_users.items():
+            metrics["agent_active_users"].add_metric(
+                [agent_type.value, detection_rule.value], len(users)
+            )
 
         # Total unique active users on login node (denominator metric for percentage calculations)
         metrics["login_node_active_users_total"].add_metric([], len(active_uids))
@@ -337,7 +475,33 @@ def main() -> None:
         default=default_port,
         help=f"Collector HTTP port, default is {default_port}",
     )
+    parser.add_argument(
+        "--observe-processes",
+        type=float,
+        metavar="SECONDS",
+        help="Sample candidate process heuristics for this duration instead of serving metrics.",
+    )
+    parser.add_argument(
+        "--observation-output",
+        default="ai-agent-process-observations.jsonl",
+        help="JSONL output path used with --observe-processes.",
+    )
+    parser.add_argument(
+        "--sample-interval",
+        type=float,
+        default=1.0,
+        help="Seconds between observation samples (default: 1).",
+    )
     args: argparse.Namespace = parser.parse_args()
+
+    if args.observe_processes is not None:
+        if args.observe_processes <= 0 or args.sample_interval <= 0:
+            parser.error("--observe-processes and --sample-interval must be positive")
+        records = observe_processes(
+            args.observe_processes, args.sample_interval, args.observation_output
+        )
+        print(f"Wrote {records} candidate process observations to {args.observation_output}")
+        return
 
     app = make_wsgi_app(AIAgentCollector())
     httpd = make_server("", args.port, app, handler_class=NoLoggingWSGIRequestHandler)

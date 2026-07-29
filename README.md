@@ -15,7 +15,8 @@ Prometheus exporter for tracking AI coding agent usage (e.g., Claude Code, Aider
   - Antigravity / Gemini CLI (`antigravity`)
   - Continue (`continue-server`)
 - **Remote Agent & Heuristic Matcher**: Detects SSH-invoked remote agent subshells (pattern matching on stderr redirections like `2>/dev/null` combined with agent context).
-- **Remote SSH Attribution**: Resource metrics include `detection_source="direct"`, `"remote"`, or `"remote_ssh"`. Remote launchers can explicitly mark a command without classifying ordinary SSH use as AI activity: `AI_AGENTS_USAGE_EXPORTER_AGENT_TYPE=codex <command>`.
+- **Transparent Remote SSH Heuristics**: Resource metrics include a `detection_rule` label. For example, `ssh:agent_signature` identifies a known agent launched over SSH and `ssh:noninteractive_command` identifies a non-interactive SSH command without agent-specific evidence. The latter is intentionally a low-confidence heuristic, so dashboards can include or exclude it explicitly.
+- **Heuristic Observation Mode**: `--observe-processes 120 --observation-output observations.jsonl` samples candidate processes for two minutes. Each JSONL record includes the selected classification and all matching heuristic codes (for example `ssh:stderr_redirection`); environment values are never recorded and common inline secrets are redacted from command lines.
 - **Resource Usage Metrics**: Tracks process count, RSS memory bytes, CPU time, and thread count per user and per agent type.
 - **Login Node Denominator Metric**: Exposes `login_node_active_users_total` (total unique active users on the login node) so Prometheus/Grafana can compute the percentage of active users utilizing AI agents.
 - **Lightweight & Fast**: Pure Python WSGI HTTP server with zero heavy web framework dependencies.

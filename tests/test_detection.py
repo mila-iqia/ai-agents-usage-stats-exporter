@@ -9,34 +9,44 @@ from __future__ import annotations
 
 from typing import Any
 import pytest
-from ai_agents_usage_stats_exporter import AIAgentCollector, ProcInfo, detect_agent_type
+from ai_agents_usage_stats_exporter import (
+    AIAgentCollector,
+    AgentType,
+    DetectionRule,
+    ProcInfo,
+    detect_agent,
+    matched_heuristics,
+    sanitized_cmdline,
+)
 
 
 @pytest.mark.parametrize(
     "proc_info, expected",
     [
-        ({"name": "claude", "cmdline": ["claude"]}, ("claude", False)),
-        ({"name": "codex", "cmdline": ["codex", "exec"]}, ("codex", False)),
+        ({"name": "claude", "cmdline": ["claude"]}, (AgentType.CLAUDE, False)),
+        ({"name": "codex", "cmdline": ["codex", "exec"]}, (AgentType.CODEX, False)),
         (
             {"name": "node", "cmdline": ["node", "/path/to/@anthropic-ai/claude-code/cli.js"]},
-            ("claude", False),
+            (AgentType.CLAUDE, False),
         ),
-        ({"name": "aider", "cmdline": ["aider", "--model", "gpt-4o"]}, ("aider", False)),
-        ({"name": "python3", "cmdline": ["python3", "-m", "aider"]}, ("aider", False)),
+        ({"name": "aider", "cmdline": ["aider", "--model", "gpt-4o"]}, (AgentType.AIDER, False)),
+        ({"name": "python3", "cmdline": ["python3", "-m", "aider"]}, (AgentType.AIDER, False)),
         (
             {"name": "cursor-server", "cmdline": ["/home/user/.cursor-server/bin/cursor-server"]},
-            ("cursor", False),
+            (AgentType.CURSOR, False),
         ),
-        ({"name": "copilot-agent", "cmdline": ["copilot-agent"]}, ("copilot", False)),
-        ({"name": "openhands", "cmdline": ["openhands", "run"]}, ("openhands", False)),
-        ({"name": "goose", "cmdline": ["goose"]}, ("goose", False)),
-        ({"name": "antigravity", "cmdline": ["antigravity"]}, ("antigravity", False)),
+        ({"name": "copilot-agent", "cmdline": ["copilot-agent"]}, (AgentType.COPILOT, False)),
+        ({"name": "openhands", "cmdline": ["openhands", "run"]}, (AgentType.OPENHANDS, False)),
+        ({"name": "goose", "cmdline": ["goose"]}, (AgentType.GOOSE, False)),
+        ({"name": "antigravity", "cmdline": ["antigravity"]}, (AgentType.ANTIGRAVITY, False)),
     ],
 )
-def test_direct_agent_signatures(proc_info: ProcInfo, expected: tuple[str | None, bool]) -> None:
+def test_direct_agent_signatures(proc_info: ProcInfo, expected: tuple[AgentType, bool]) -> None:
     """Test detection of direct AI agent binary names, packages, and module execution patterns."""
-    result: tuple[str | None, bool] = detect_agent_type(proc_info)
-    assert result == expected
+    agent_type, is_remote = expected
+    expected_rule = DetectionRule.CMDLINE_AGENT_SIGNATURE
+    assert detect_agent(proc_info) == (agent_type, expected_rule)
+    assert is_remote is False
 
 
 def test_environment_variable_detection() -> None:
@@ -46,27 +56,29 @@ def test_environment_variable_detection() -> None:
         "cmdline": ["python", "script.py"],
         "environ": {"CLAUDE_CODE_ENTRYPOINT": "cli"},
     }
-    assert detect_agent_type(proc_info) == ("claude", True)
+    assert detect_agent(proc_info) == (AgentType.CLAUDE, DetectionRule.ENV_CLAUDE)
 
     proc_info_aider: ProcInfo = {
         "name": "python",
         "cmdline": ["python", "app.py"],
         "environ": {"AIDER_MODEL": "claude-3-5-sonnet"},
     }
-    assert detect_agent_type(proc_info_aider) == ("aider", True)
+    assert detect_agent(proc_info_aider) == (AgentType.AIDER, DetectionRule.ENV_AIDER)
 
 
-def test_explicit_remote_ssh_agent_marker() -> None:
-    """Only an explicitly marked SSH command is categorized as remote SSH agent use."""
+def test_noninteractive_ssh_heuristic() -> None:
+    """Non-interactive SSH commands are detected with a transparent rule code."""
     proc_info: ProcInfo = {
         "name": "sleep",
         "cmdline": ["sleep", "10"],
         "environ": {
-            "AI_AGENTS_USAGE_EXPORTER_AGENT_TYPE": "codex",
             "SSH_CONNECTION": "192.0.2.1 22 192.0.2.2 12345",
         },
     }
-    assert detect_agent_type(proc_info) == ("codex", True)
+    assert detect_agent(proc_info) == (
+        AgentType.REMOTE_AGENT,
+        DetectionRule.SSH_NONINTERACTIVE_COMMAND,
+    )
 
 
 def test_remote_subshell_heuristics() -> None:
@@ -76,7 +88,16 @@ def test_remote_subshell_heuristics() -> None:
         "cmdline": ["bash", "-c", "git status 2>/dev/null"],
         "environ": {"CLAUDE_CODE": "1"},
     }
-    assert detect_agent_type(proc_info) == ("remote_agent", True)
+    assert detect_agent(proc_info) == (AgentType.REMOTE_AGENT, DetectionRule.SSH_STDERR_REDIRECTION)
+    assert DetectionRule.SSH_STDERR_REDIRECTION in matched_heuristics(proc_info)
+
+
+def test_sanitized_cmdline_redacts_inline_secrets() -> None:
+    assert sanitized_cmdline(["tool", "api_key=abc123", "--safe"]) == [
+        "tool",
+        "api_key=[REDACTED]",
+        "--safe",
+    ]
 
 
 def test_non_agent_process() -> None:
@@ -86,7 +107,7 @@ def test_non_agent_process() -> None:
         "cmdline": ["vim", "file.txt"],
         "environ": {},
     }
-    assert detect_agent_type(proc_info) == (None, False)
+    assert detect_agent(proc_info) == (None, None)
 
 
 def test_collector_metrics_output() -> None:
