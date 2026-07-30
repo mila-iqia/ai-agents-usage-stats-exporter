@@ -376,8 +376,8 @@ def detect_agent(proc_info: ProcInfo) -> DetectionResult | None:
     # SSH does not identify the local program that issued a command.  Treat an
     # agent-less, non-interactive SSH command as a low-confidence remote-agent
     # heuristic, but make that fact visible to metric consumers in its rule code.
-    if "SSH_CONNECTION" in envs and "SSH_TTY" not in envs:
-        add_match(AgentType.REMOTE_AGENT, DetectionRule.SSH_NONINTERACTIVE_COMMAND)
+    # if "SSH_CONNECTION" in envs and "SSH_TTY" not in envs:
+    #     add_match(AgentType.REMOTE_AGENT, DetectionRule.SSH_NONINTERACTIVE_COMMAND)
 
     if selected is None:
         return None
