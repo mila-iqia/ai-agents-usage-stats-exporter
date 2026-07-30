@@ -2,6 +2,7 @@
 
 Prometheus exporter for tracking AI coding agent usage (e.g., Claude Code, Aider, Cursor, Copilot, OpenHands, Goose, etc.) and active user statistics on Slurm cluster login nodes.
 
+
 ## Features
 
 - **Multi-Agent Process Detection**: Detects direct agent executables, Node/Python modules, and environment flags for popular AI coding agents:
