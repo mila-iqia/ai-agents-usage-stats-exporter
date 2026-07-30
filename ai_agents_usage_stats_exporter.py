@@ -106,7 +106,8 @@ KNOWN_AGENT_SIGNATURES = [
     (
         AgentType.CLAUDE,
         re.compile(
-            r"(^|/|\s)(claude|claude-code|@anthropic-ai/claude-code)($|\s|/)", re.IGNORECASE
+            r"(^|/|\s)(ccd-cli|\.claude|claude|claude-code|@anthropic-ai/claude-code)($|\s|/)",
+            re.IGNORECASE,
         ),
     ),
     # Aider AI pair programmer (e.g. `aider`, `python -m aider`)
