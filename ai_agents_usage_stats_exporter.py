@@ -230,7 +230,7 @@ def collect_metrics(debug: bool = False) -> Iterable[Metric]:
                 proc_info["environ"] = {}
 
             user = UsernameOrUID(get_username(uid))
-            command = " ".join(shlex.join(proc_info.get("cmdline", []) or []).split())
+            command = get_command(proc_info)
             if user == "root":
                 continue
             # Determine if process is an AI agent process
@@ -350,6 +350,14 @@ def get_username(uid: int) -> str:
     except Exception:
         # Fallback to string UID if user resolution fails or UID is ephemeral
         return f"uid_{uid}"
+
+
+def get_command(proc_info: ProcInfo) -> str:
+    """Returns a compact string of the command line for this process."""
+    command_parts = proc_info.get("cmdline") or []
+    command = shlex.join(command_parts)
+    command = " ".join(command.split())  # Replace multiple spaces/tabs with a single space.
+    return command
 
 
 def detect_agent(proc_info: ProcInfo) -> DetectionResult | None:
