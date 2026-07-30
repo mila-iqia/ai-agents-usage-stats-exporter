@@ -10,7 +10,10 @@ metrics (CPU, memory, threads, process counts, user counts) to Prometheus.
 from __future__ import annotations
 
 import argparse
+import collections
+import logging
 import re
+import shlex
 import subprocess
 import time
 from enum import Enum
@@ -23,6 +26,7 @@ from prometheus_client import make_wsgi_app
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
 from typing_extensions import NewType
 
+logger = logging.getLogger(__name__)
 UsernameOrUID = NewType("UsernameOrUID", str)
 
 
@@ -154,7 +158,7 @@ class AIAgentCollector:
         yield from collect_metrics()
 
 
-def collect_metrics() -> Iterable[Metric]:
+def collect_metrics(debug: bool = False) -> Iterable[Metric]:
     """Scans system processes and yields Prometheus Metric objects."""
     start_time = time.time()
 
@@ -199,7 +203,8 @@ def collect_metrics() -> Iterable[Metric]:
     agent_stats: dict[tuple[UsernameOrUID, AgentType, DetectionRule], AgentResourceStats] = {}
     agent_users: dict[tuple[AgentType, DetectionRule], set[UsernameOrUID]] = {}
     active_uids: set[int] = set()
-
+    match_commands: dict[UsernameOrUID, list[str]] = collections.defaultdict(list)
+    no_match_commands: dict[UsernameOrUID, list[str]] = collections.defaultdict(list)
     # Iterate over all running system processes retrieving key attributes in a single pass
     for proc in psutil.process_iter(attrs=["pid", "uids", "name", "exe", "cmdline"]):
         try:
@@ -224,14 +229,22 @@ def collect_metrics() -> Iterable[Metric]:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 proc_info["environ"] = {}
 
+            user = UsernameOrUID(get_username(uid))
+            command = " ".join(shlex.join(proc_info.get("cmdline", []) or []).split())
+            if user == "root":
+                continue
             # Determine if process is an AI agent process
             detection = detect_agent(proc_info)
             if detection is None:
+                logger.debug("No match for User %s's command: %s", user, command)
+                if debug:
+                    no_match_commands[user].append(command)
                 continue
+            logger.debug("MATCH for User %s's command: %s", user, command)
+            if debug:
+                match_commands[user].append(command)
             agent_type = detection.agent_type
             detection_rule = detection.detection_rule
-
-            user = UsernameOrUID(get_username(uid))
 
             # Collect memory usage (RSS in bytes)
             try:
@@ -296,6 +309,22 @@ def collect_metrics() -> Iterable[Metric]:
     # Record scrape duration self-monitoring metric
     duration: float = time.time() - start_time
     metrics["scrape_duration"].add_metric([], duration)
+    if debug:
+        import json
+
+        logger.debug(
+            "Matched (presumably AI-related) commands: %d",
+            sum(len(cmds) for cmds in match_commands.values()),
+        )
+        logger.debug(
+            "Not Matched (presumably NOT AI-related) commands: %d",
+            sum(len(cmds) for cmds in no_match_commands.values()),
+        )
+        with open("matches.json", "w") as f:
+            json.dump(match_commands, f, indent=2)
+        with open("no_matches.json", "w") as f:
+            json.dump(no_match_commands, f, indent=2)
+        logger.debug("Scrape duration: %.3f seconds", duration)
 
     emitted_metrics: tuple[Metric, ...] = (
         metrics["process_count"],
@@ -403,8 +432,22 @@ def main() -> None:
         default=default_port,
         help=f"Collector HTTP port, default is {default_port}",
     )
-    args: argparse.Namespace = parser.parse_args()
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Run a single collection pass on the current system, outputs the matched and non-matched "
+            "commands per user to json files for debugging/analysis."
+        ),
+    )
 
+    args: argparse.Namespace = parser.parse_args()
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG)
+        # need to pull from the generator for the function to run.
+        # No need to print the metrics. We just want to dump the jsons when debugging.
+        list(collect_metrics(debug=True))
+        exit()
     app = make_wsgi_app(AIAgentCollector())
     httpd = make_server("", args.port, app, handler_class=NoLoggingWSGIRequestHandler)
     print(f"Starting AI Agents Usage Stats Exporter on port {args.port}...")
