@@ -125,7 +125,7 @@ KNOWN_AGENT_SIGNATURES = [
     # Block Goose AI coding agent
     (AgentType.GOOSE, re.compile(r"(^|/|\s)(goose|goose-agent)($|\s|/)", re.IGNORECASE)),
     # Antigravity / Gemini AI agent tool
-    (AgentType.ANTIGRAVITY, re.compile(r"(^|/|\s)(antigravity)($|\s|/)", re.IGNORECASE)),
+    (AgentType.ANTIGRAVITY, re.compile(r"(^|/|\s)(antigravity|agy)($|\s|/)", re.IGNORECASE)),
     # Continue IDE agent server
     (
         AgentType.CONTINUE,
